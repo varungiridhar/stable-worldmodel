@@ -29,10 +29,26 @@ def img_transform(cfg, dtype=torch.float32):
     return transform
 
 
+def _episode_col(dataset):
+    """Return the episode-index column name.
+
+    The Lance dataset hides its index columns (``episode_idx``/``step_idx``)
+    from ``column_names`` (data columns only), so the old
+    ``'episode_idx' in dataset.column_names`` probe wrongly fell back to
+    ``ep_idx`` (the HDF5 name) and crashed. ``get_col_data`` *does* serve the
+    index columns, so probe by trying to fetch them (results are cached).
+    """
+    for c in ('episode_idx', 'ep_idx'):
+        try:
+            dataset.get_col_data(c)
+            return c
+        except Exception:  # noqa: BLE001
+            continue
+    raise KeyError('no episode-index column (episode_idx/ep_idx) found')
+
+
 def get_episodes_length(dataset, episodes):
-    col_name = (
-        'episode_idx' if 'episode_idx' in dataset.column_names else 'ep_idx'
-    )
+    col_name = _episode_col(dataset)
 
     episode_idx = dataset.get_col_data(col_name)
     step_idx = dataset.get_col_data('step_idx')
@@ -72,9 +88,7 @@ def run(cfg: DictConfig):
 
     dataset = get_dataset(cfg, cfg.eval.dataset_name)
     stats_dataset = dataset  # get_dataset(cfg, cfg.dataset.stats)
-    col_name = (
-        'episode_idx' if 'episode_idx' in dataset.column_names else 'ep_idx'
-    )
+    col_name = _episode_col(dataset)
     ep_indices, _ = np.unique(
         stats_dataset.get_col_data(col_name), return_index=True
     )
@@ -137,9 +151,7 @@ def run(cfg: DictConfig):
         ep_id: max_start_idx[i] for i, ep_id in enumerate(ep_indices)
     }
     # Map each dataset row’s episode_idx to its max_start_idx
-    col_name = (
-        'episode_idx' if 'episode_idx' in dataset.column_names else 'ep_idx'
-    )
+    col_name = _episode_col(dataset)
     max_start_per_row = np.array(
         [max_start_idx_dict[ep_id] for ep_id in dataset.get_col_data(col_name)]
     )
@@ -159,13 +171,28 @@ def run(cfg: DictConfig):
 
     print(random_episode_indices)
 
-    eval_episodes = dataset.get_row_data(random_episode_indices)[col_name]
-    eval_start_idx = dataset.get_row_data(random_episode_indices)['step_idx']
+    # Index columns aren't in the Lance dataset's get_row_data (_keys excludes
+    # them); get_col_data serves them (cached) — index the full column by row.
+    eval_episodes = dataset.get_col_data(col_name)[random_episode_indices]
+    eval_start_idx = dataset.get_col_data('step_idx')[random_episode_indices]
 
     if len(eval_episodes) < cfg.eval.num_eval:
         raise ValueError(
             'Not enough episodes with sufficient length for evaluation.'
         )
+
+    # determinism debug hook: log every per-step action when DUMP_ACTIONS is set
+    _dump_path = os.environ.get('DUMP_ACTIONS')
+    if _dump_path:
+        _actions_log = []
+        _orig_get_action = policy.get_action
+
+        def _logging_get_action(*a, **k):
+            out = _orig_get_action(*a, **k)
+            _actions_log.append(np.asarray(out).copy())
+            return out
+
+        policy.get_action = _logging_get_action
 
     world.set_policy(policy)
 
@@ -217,6 +244,11 @@ def run(cfg: DictConfig):
             video=results_path,
         )
     end_time = time.time()
+
+    if _dump_path:
+        acts = np.stack(_actions_log)
+        np.save(_dump_path, acts)
+        print(f'[determinism] saved actions {acts.shape} to {_dump_path}')
 
     print(metrics)
     print(f'[eval] videos saved to {results_path.resolve()}')

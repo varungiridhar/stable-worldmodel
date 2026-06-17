@@ -291,10 +291,19 @@ def run(cfg):
         logger = WandbLogger(**cfg.wandb.config)
         logger.log_hyperparams(OmegaConf.to_container(cfg))
 
+    # CPUOffloadCallback was removed in stable_pretraining>=0.1.7. It is only a
+    # VRAM-saving optimization and is unnecessary for a frozen dinov2_small +
+    # small predictor on a 24 GB GPU, so include it only if the installed spt
+    # still provides it (keeps this script portable across spt versions).
+    extra_cbs = (
+        [spt.callbacks.CPUOffloadCallback()]
+        if hasattr(spt.callbacks, 'CPUOffloadCallback')
+        else []
+    )
     trainer = pl.Trainer(
         **cfg.trainer,
         callbacks=[
-            spt.callbacks.CPUOffloadCallback(),
+            *extra_cbs,
             SaveCkptCallback(
                 run_name=cfg.output_model_name,
                 cfg=cfg.model,
@@ -306,6 +315,24 @@ def run(cfg):
         logger=logger,
         enable_checkpointing=True,
     )
+
+    # spt 0.1.7's Manager.init_and_sync_wandb() assumes a *previous* completed
+    # run dir (files/wandb-config.json) to reload config from on requeue/resume.
+    # For a fresh OFFLINE run that file doesn't exist, so it raises
+    # FileNotFoundError/TypeError and aborts training. The sync is a non-essential
+    # resume convenience, so wrap it to no-op on failure while keeping wandb
+    # offline. (Guard for spt<=0.1.7; harmless if upstream fixes it.)
+    _orig_sync = spt.Manager.init_and_sync_wandb
+
+    def _safe_init_and_sync_wandb(self):
+        try:
+            _orig_sync(self)
+        except Exception as e:  # noqa: BLE001
+            logging.warning(
+                f'Skipping spt wandb resume-sync (fresh offline run): {e!r}'
+            )
+
+    spt.Manager.init_and_sync_wandb = _safe_init_and_sync_wandb
 
     ckpt_path = run_dir / f'{cfg.output_model_name}_weights.ckpt'
     manager = spt.Manager(

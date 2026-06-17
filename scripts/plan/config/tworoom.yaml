@@ -30,15 +30,19 @@ eval:
   dataset_name: tworoom.h5
   callables:
     # -- set state
+    # NOTE: collect_tworooms.py records the agent/target positions under the
+    # `state`/`goal_state` columns (see two_room/env.py _get_obs); the stock
+    # `pos_agent`/`goal_pos_agent` names match the S3 tworoom.h5, not our
+    # locally-collected tworoom_expert.lance.
     - method: _set_state
       args:
         state:
-          value: pos_agent
+          value: state
     # -- set goal state
     - method: _set_goal_state
       args:
         goal_state:
-          value: goal_pos_agent
+          value: goal_state
 
 output:
   filename: tworoom_results.txt
