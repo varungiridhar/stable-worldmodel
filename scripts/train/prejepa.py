@@ -160,6 +160,11 @@ def dinowm_forward(self, batch, stage, cfg):
 
 @hydra.main(version_base=None, config_path='./config', config_name='prejepa')
 def run(cfg):
+    # Seed init + dropout + dataloader together for reproducible training.
+    # (prejepa/spt only seeded the dataloader generator, leaving the predictor's
+    # weight init and dropout masks drawing from an unseeded global RNG.)
+    pl.seed_everything(cfg.seed, workers=True)
+
     # --- Dataset ---
     encoding_keys = list(cfg.wm.get('encoding', {}).keys())
     keys_to_load = ['pixels'] + encoding_keys
