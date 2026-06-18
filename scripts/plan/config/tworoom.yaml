@@ -46,3 +46,19 @@ eval:
 
 output:
   filename: tworoom_results.txt
+
+# ESNR probe (scripts/plan/esnr_probe.py) -- ignored by eval_wm.py.
+# Uses the same start states / goal_offset / dataset as eval; B = eval.num_eval.
+esnr:
+  num_samples: 300      # N action samples per observation
+  var_scale: 1.0        # CEM-prior std of the action proposal N(0, var_scale)
+  obs_batch: 1          # observations held in memory together
+  sample_batch: 16      # action samples per get_cost+backward (bounds GPU mem;
+                        # exact -- per-sample grads are independent)
+  proposal: prior       # only 'prior' implemented
+  out_csv: ./esnr_row.csv
+  train_seed: null      # provenance only (recorded in the CSV row)
+  global_step: null     # provenance only
+  # -- batched sweep (esnr_probe_sweep.py) --
+  run_name: null        # checkpoint dir under $STABLEWM_HOME/checkpoints/ to sweep
+  out_dir: ./esnr_rows  # one CSV per checkpoint written here (skip-if-exists)

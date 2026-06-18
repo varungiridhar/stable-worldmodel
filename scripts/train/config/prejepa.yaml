@@ -11,6 +11,16 @@ output_model_name: pusht_${backbone.type}_p${predictor.size}
 subdir: null
 seed: 42
 
+# --- Checkpointing ---
+# epoch_interval: save every N epochs (+ always the final epoch).
+# intra_epoch_steps: extra saves the first time global step crosses each value,
+#   only while current_epoch < intra_epoch_max_epoch (dense early ckpts for the
+#   ESNR U-shape). Files: weights_step_<N>.pt (intra) / weights_epoch_<N>.pt.
+ckpt:
+  epoch_interval: 5
+  intra_epoch_steps: []
+  intra_epoch_max_epoch: 0
+
 # --- Data ---
 dataset_name: pusht_expert_train_video
 cache_dir: null

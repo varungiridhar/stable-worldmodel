@@ -18,6 +18,12 @@ train_value_function: False
 projector_loss_weight: 1e-3
 dump_object: True
 
+# --- Checkpointing --- (see prejepa.yaml for field semantics)
+ckpt:
+  epoch_interval: 1
+  intra_epoch_steps: []
+  intra_epoch_max_epoch: 0
+
 trainer:
   max_epochs: 100
   devices: auto

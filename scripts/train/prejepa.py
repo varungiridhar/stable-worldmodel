@@ -54,29 +54,59 @@ class VideoPipeline(spt.data.transforms.Transform):
 
 
 class SaveCkptCallback(Callback):
-    """Callback to save model checkpoint after each epoch using save_pretrained."""
+    """Save model checkpoints via ``save_pretrained``.
 
-    def __init__(self, run_name, cfg, epoch_interval=1):
+    Saves every ``epoch_interval`` epochs (and always the final epoch). When
+    ``intra_epoch_steps`` is non-empty, also saves the first time the global
+    optimizer step crosses each listed threshold, but only while
+    ``current_epoch < intra_epoch_max_epoch`` -- i.e. dense early-training
+    checkpoints used to resolve the ESNR U-shape (whose minimum lands very
+    early in training). Intra-epoch files are named ``weights_step_<N>.pt``;
+    per-epoch files ``weights_epoch_<N>.pt``.
+    """
+
+    def __init__(
+        self,
+        run_name,
+        cfg,
+        epoch_interval=1,
+        intra_epoch_steps=None,
+        intra_epoch_max_epoch=0,
+    ):
         super().__init__()
         self.run_name = run_name
         self.cfg = cfg
         self.epoch_interval = epoch_interval
+        self.intra_epoch_steps = sorted(intra_epoch_steps or [])
+        self.intra_epoch_max_epoch = intra_epoch_max_epoch
+        self._saved_targets = set()
+
+    def on_train_batch_end(
+        self, trainer, pl_module, outputs, batch, batch_idx
+    ):
+        if not trainer.is_global_zero:
+            return
+        if trainer.current_epoch >= self.intra_epoch_max_epoch:
+            return
+        step = trainer.global_step
+        for target in self.intra_epoch_steps:
+            if step >= target and target not in self._saved_targets:
+                self._saved_targets.add(target)
+                self._save(pl_module.model, f'weights_step_{target}.pt')
 
     def on_train_epoch_end(self, trainer, pl_module):
         if not trainer.is_global_zero:
             return
         epoch = trainer.current_epoch + 1
-        if epoch % self.epoch_interval == 0:
-            self._save(pl_module.model, epoch)
-        if epoch == trainer.max_epochs:
-            self._save(pl_module.model, epoch)
+        if epoch % self.epoch_interval == 0 or epoch == trainer.max_epochs:
+            self._save(pl_module.model, f'weights_epoch_{epoch}.pt')
 
-    def _save(self, model, epoch):
+    def _save(self, model, filename):
         save_pretrained(
             model,
             run_name=self.run_name,
             config=self.cfg,
-            filename=f'weights_epoch_{epoch}.pt',
+            filename=filename,
         )
 
 
@@ -312,7 +342,13 @@ def run(cfg):
             SaveCkptCallback(
                 run_name=cfg.output_model_name,
                 cfg=cfg.model,
-                epoch_interval=5,
+                epoch_interval=cfg.get('ckpt', {}).get('epoch_interval', 5),
+                intra_epoch_steps=cfg.get('ckpt', {}).get(
+                    'intra_epoch_steps', None
+                ),
+                intra_epoch_max_epoch=cfg.get('ckpt', {}).get(
+                    'intra_epoch_max_epoch', 0
+                ),
             ),
             pl.pytorch.callbacks.LearningRateMonitor(logging_interval='step'),
         ],

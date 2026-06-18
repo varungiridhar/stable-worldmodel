@@ -30,31 +30,59 @@ def get_img_preprocessor(source: str, target: str, img_size: int = 224):
 
 
 class SaveCkptCallback(Callback):
-    """Callback to save model checkpoint after each epoch using save_pretrained."""
+    """Save model checkpoints via ``save_pretrained``.
 
-    def __init__(self, run_name, cfg, epoch_interval: int = 1):
+    Saves every ``epoch_interval`` epochs (and always the final epoch). When
+    ``intra_epoch_steps`` is non-empty, also saves the first time the global
+    optimizer step crosses each listed threshold, but only while
+    ``current_epoch < intra_epoch_max_epoch`` -- i.e. dense early-training
+    checkpoints used to resolve the ESNR U-shape (whose minimum lands very
+    early in training). Intra-epoch files are named ``weights_step_<N>.pt``;
+    per-epoch files ``weights_epoch_<N>.pt``.
+    """
+
+    def __init__(
+        self,
+        run_name,
+        cfg,
+        epoch_interval=1,
+        intra_epoch_steps=None,
+        intra_epoch_max_epoch=0,
+    ):
         super().__init__()
         self.run_name = run_name
         self.cfg = cfg
         self.epoch_interval = epoch_interval
+        self.intra_epoch_steps = sorted(intra_epoch_steps or [])
+        self.intra_epoch_max_epoch = intra_epoch_max_epoch
+        self._saved_targets = set()
+
+    def on_train_batch_end(
+        self, trainer, pl_module, outputs, batch, batch_idx
+    ):
+        if not trainer.is_global_zero:
+            return
+        if trainer.current_epoch >= self.intra_epoch_max_epoch:
+            return
+        step = trainer.global_step
+        for target in self.intra_epoch_steps:
+            if step >= target and target not in self._saved_targets:
+                self._saved_targets.add(target)
+                self._save(pl_module.model, f'weights_step_{target}.pt')
 
     def on_train_epoch_end(self, trainer, pl_module):
-        super().on_train_epoch_end(trainer, pl_module)
+        if not trainer.is_global_zero:
+            return
+        epoch = trainer.current_epoch + 1
+        if epoch % self.epoch_interval == 0 or epoch == trainer.max_epochs:
+            self._save(pl_module.model, f'weights_epoch_{epoch}.pt')
 
-        if trainer.is_global_zero:
-            if (trainer.current_epoch + 1) % self.epoch_interval == 0:
-                self._save(pl_module.model, trainer.current_epoch + 1)
-
-            # save final epoch
-            if (trainer.current_epoch + 1) == trainer.max_epochs:
-                self._save(pl_module.model, trainer.current_epoch + 1)
-
-    def _save(self, model, epoch):
+    def _save(self, model, filename):
         save_pretrained(
             model,
             run_name=self.run_name,
             config=self.cfg,
-            filename=f'weights_epoch_{epoch}.pt',
+            filename=filename,
         )
 
 
@@ -212,7 +240,13 @@ def run(cfg):
         OmegaConf.save(cfg, f)
 
     object_dump_callback = SaveCkptCallback(
-        run_name=cfg.output_model_name, cfg=cfg, epoch_interval=5
+        run_name=cfg.output_model_name,
+        cfg=cfg.model,
+        epoch_interval=cfg.get('ckpt', {}).get('epoch_interval', 5),
+        intra_epoch_steps=cfg.get('ckpt', {}).get('intra_epoch_steps', None),
+        intra_epoch_max_epoch=cfg.get('ckpt', {}).get(
+            'intra_epoch_max_epoch', 0
+        ),
     )
 
     trainer = pl.Trainer(
@@ -222,6 +256,23 @@ def run(cfg):
         logger=logger,
         enable_checkpointing=True,
     )
+
+    # spt 0.1.7's Manager.init_and_sync_wandb() assumes a *previous* completed
+    # run dir to reload config from on requeue/resume. For a fresh OFFLINE run
+    # that file doesn't exist, so it raises and aborts training. The sync is a
+    # non-essential resume convenience, so wrap it to no-op on failure while
+    # keeping wandb offline. (Guard for spt<=0.1.7; harmless if upstream fixes.)
+    _orig_sync = spt.Manager.init_and_sync_wandb
+
+    def _safe_init_and_sync_wandb(self):
+        try:
+            _orig_sync(self)
+        except Exception as e:  # noqa: BLE001
+            logging.warning(
+                f'Skipping spt wandb resume-sync (fresh offline run): {e!r}'
+            )
+
+    spt.Manager.init_and_sync_wandb = _safe_init_and_sync_wandb
 
     ckpt_path = run_dir / f'{cfg.output_model_name}_weights.ckpt'
     manager = spt.Manager(
