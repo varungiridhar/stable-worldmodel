@@ -23,6 +23,10 @@ ckpt:
   epoch_interval: 1
   intra_epoch_steps: []
   intra_epoch_max_epoch: 0
+  # Uniform probe-snapshot cadence across ALL epochs (0 = off). For long runs:
+  # saves weights_step_<global_step>.pt every N steps so the full ESNR-vs-step
+  # trajectory is resolvable without 1-per-epoch saves.
+  step_interval: 0
 
 trainer:
   max_epochs: 100
