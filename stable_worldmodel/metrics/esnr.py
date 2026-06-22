@@ -180,7 +180,7 @@ def _clear_wm_caches(model) -> None:
             delattr(model, attr)
 
 
-def run_planning_esnr(
+def collect_planning_grads(
     model,
     info: dict,
     *,
@@ -195,15 +195,19 @@ def run_planning_esnr(
     proposal: str = 'prior',
     solver=None,
     clear_caches: bool = True,
-) -> dict:
-    """Compute planning-ESNR for one checkpoint over a batch of observations.
+    capture_cost_sens: bool = False,
+):
+    """Collect the per-sample action-gradient stack for one checkpoint.
 
-    The backward pass is chunked over BOTH observations (``obs_batch``) and
-    action samples (``sample_batch``); since the cost of candidate ``(b, n)``
-    depends only on ``actions[b, n]``, mini-batching the gradient is exact (not
-    an approximation) and bounds peak GPU memory regardless of architecture or
-    ``num_samples``. The full action set is sampled up front, so the result is
-    independent of the chunk sizes (depends only on ``seed``/``num_samples``).
+    This is the model-touching core shared by :func:`run_planning_esnr` (which
+    reduces the stack to the scalar ESNR) and the Phase-2 EPGQ metrics (which
+    operate on the full stack). The backward pass is chunked over BOTH
+    observations (``obs_batch``) and action samples (``sample_batch``); since
+    the cost of candidate ``(b, n)`` depends only on ``actions[b, n]``,
+    mini-batching the gradient is exact (not an approximation) and bounds peak
+    GPU memory regardless of architecture or ``num_samples``. The full action
+    set is sampled up front, so the result is independent of the chunk sizes
+    (depends only on ``seed``/``num_samples``).
 
     Args:
         model: world model with a differentiable ``get_cost`` (frozen params ok).
@@ -217,14 +221,20 @@ def run_planning_esnr(
         sample_batch: action samples per get_cost+backward (default 16; lower
             for heavy encoders like DINOv2, higher for light ones).
         proposal: ``'prior'`` = CEM prior N(0, var_scale); ``'cem_optimized'`` =
-            on-policy, samples N(mean, std) around the converged CEM plan
-            (requires ``solver``, a configured CEMSolver whose ``.model`` is this
-            checkpoint's model).
-        solver: configured CEMSolver, used only for ``proposal='cem_optimized'``.
+            on-policy, samples N(mean, std) around the converged CEM plan;
+            ``'cem_centered'`` = optimized mean, fixed var_scale spread (both
+            CEM proposals require ``solver``).
+        solver: configured CEMSolver, used only for the CEM proposals.
+        capture_cost_sens: also capture the last-step latent cost-sensitivity
+            residual ``pred_emb - goal_emb`` (``d cost / d pred_emb``, up to the
+            factor 2) by wrapping ``model.criterion``. Best-effort: ``None`` if
+            the model has no compatible ``criterion``. Off by the ESNR path.
 
     Returns:
-        :func:`compute_esnr_from_grads` dict, plus ``num_obs``, ``num_samples``,
-        ``var_scale``, ``proposal``, ``sample_batch``, ``cem_std_mean``.
+        ``(grads_all, costs_all, aux)`` where ``grads_all`` is ``(N, B, D)``
+        float64 on CPU, ``costs_all`` is ``(N, B)`` float64 on CPU, and ``aux``
+        is ``{'cem_std_mean', 'cost_sens' (N, B, D_lat) float32 CPU or None,
+        'n_obs'}``.
     """
     if proposal not in ('prior', 'cem_optimized', 'cem_centered'):
         raise NotImplementedError(f"proposal '{proposal}' not implemented")
@@ -242,6 +252,8 @@ def run_planning_esnr(
     #     std collapses to the sharp optimum -> gradients vanish for good models)
     #   cem_centered  -> N(mean, var_scale)      (planning neighborhood at a
     #     fixed, non-degenerate spread around the optimized plan)
+    # NOTE: this runs BEFORE the optional criterion wrap below, so the many
+    # get_cost calls inside solver.solve do not pollute the cost_sens capture.
     cem_mean = cem_std = None
     cem_std_mean = ''
     if proposal in ('cem_optimized', 'cem_centered'):
@@ -266,67 +278,177 @@ def run_planning_esnr(
         if clear_caches:
             _clear_wm_caches(model)
 
+    # optional cost-sensitivity capture: wrap model.criterion to stash the
+    # last-step latent residual (pred_emb - goal_emb). LeWM/PLDM compute
+    # cost = sum((pred_emb[...,-1,:] - goal_emb[...,-1,:])**2) with no averaging,
+    # so this residual is exactly (1/2) d cost / d pred_emb. Fully isolated and
+    # best-effort: any failure leaves cost_sens None and never affects grads.
+    cs_holder = {'last': None}
+    orig_criterion = None
+    if capture_cost_sens and hasattr(model, 'criterion'):
+        orig_criterion = model.criterion
+
+        def _wrapped_criterion(
+            *args, _orig=orig_criterion, _h=cs_holder, **kw
+        ):
+            # forward *args/**kw verbatim: criterion's arity differs by arch
+            # (LeWM/PLDM take info_dict; PreJEPA takes info_dict, actions).
+            cost = _orig(*args, **kw)
+            try:
+                info_dict = args[0]
+                pe = info_dict['predicted_emb']  # (B, S, T, D_lat)
+                ge = info_dict['goal_emb']  # (B, T, D_lat)
+                resid = (pe[:, :, -1, :] - ge[:, None, -1, :]).detach()
+                _h['last'] = resid.to('cpu', torch.float32)  # (B, S, D_lat)
+            except Exception:  # noqa: BLE001
+                _h['last'] = None
+            return cost
+
+        model.criterion = _wrapped_criterion
+
     gen = torch.Generator(device=device).manual_seed(int(seed))
     grad_chunks = []  # each (N, ob, D)
+    cost_chunks = []  # each (N, ob)
+    cs_chunks = [] if capture_cost_sens else None  # each (N, ob, D_lat)
 
-    for start in range(0, n_obs, obs_batch):
-        end = min(start + obs_batch, n_obs)
-        ob = end - start
+    try:
+        for start in range(0, n_obs, obs_batch):
+            end = min(start + obs_batch, n_obs)
+            ob = end - start
 
-        sub = {}
-        for k, v in info.items():
-            if torch.is_tensor(v) or isinstance(v, np.ndarray):
-                sub[k] = v[start:end]
+            sub = {}
+            for k, v in info.items():
+                if torch.is_tensor(v) or isinstance(v, np.ndarray):
+                    sub[k] = v[start:end]
+                else:
+                    sub[k] = v
+
+            # sample all N trajectories up front (cheap, chunk-invariant)
+            center = cem_mean[start:end] if cem_mean is not None else None
+            scale = cem_std[start:end] if cem_std is not None else None
+            actions_full = sample_action_trajectories(
+                ob,
+                num_samples,
+                horizon,
+                action_dim,
+                var_scale,
+                gen,
+                device,
+                center=center,
+                scale=scale,
+            )
+
+            sb_grads = []  # each (sbn, ob, D)
+            sb_costs = []  # each (sbn, ob)
+            sb_cs = [] if capture_cost_sens else None  # each (sbn, ob, D_lat)
+            for s0 in range(0, num_samples, sample_batch):
+                s1 = min(s0 + sample_batch, num_samples)
+                # clear PreJEPA's instance cache each mini-batch: its cached goal
+                # embedding is expanded to the *sample count*, which varies on the
+                # last (partial) mini-batch. LeWM/PLDM cache inside the (rebuilt)
+                # dict, so they re-encode automatically.
+                if clear_caches:
+                    _clear_wm_caches(model)
+                actions = actions_full[:, s0:s1].detach().requires_grad_(True)
+                expanded = expand_info_for_samples(
+                    sub, s1 - s0, device, torch.float32
+                )
+                with torch.enable_grad():
+                    grads, cost = action_objective_grads(
+                        model, expanded, actions
+                    )
+                sb_grads.append(
+                    grads.detach()
+                    .permute(1, 0, 2, 3)
+                    .reshape(s1 - s0, ob, horizon * action_dim)
+                    .to('cpu', torch.float64)
+                )
+                sb_costs.append(
+                    cost.transpose(0, 1).to('cpu', torch.float64)  # (sbn, ob)
+                )
+                if sb_cs is not None:
+                    last = cs_holder['last']
+                    if last is not None:
+                        sb_cs.append(last.permute(1, 0, 2))  # (sbn, ob, D_lat)
+                    else:
+                        sb_cs = None  # a missing chunk disables cost_sens
+            grad_chunks.append(torch.cat(sb_grads, dim=0))  # (N, ob, D)
+            cost_chunks.append(torch.cat(sb_costs, dim=0))  # (N, ob)
+            if cs_chunks is not None and sb_cs is not None:
+                cs_chunks.append(torch.cat(sb_cs, dim=0))  # (N, ob, D_lat)
             else:
-                sub[k] = v
-
-        # sample all N trajectories up front (cheap, chunk-invariant)
-        center = cem_mean[start:end] if cem_mean is not None else None
-        scale = cem_std[start:end] if cem_std is not None else None
-        actions_full = sample_action_trajectories(
-            ob,
-            num_samples,
-            horizon,
-            action_dim,
-            var_scale,
-            gen,
-            device,
-            center=center,
-            scale=scale,
-        )
-
-        sb_grads = []  # each (sbn, ob, D)
-        for s0 in range(0, num_samples, sample_batch):
-            s1 = min(s0 + sample_batch, num_samples)
-            # clear PreJEPA's instance cache each mini-batch: its cached goal
-            # embedding is expanded to the *sample count*, which varies on the
-            # last (partial) mini-batch. LeWM/PLDM cache inside the (rebuilt)
-            # dict, so they re-encode automatically.
-            if clear_caches:
-                _clear_wm_caches(model)
-            actions = actions_full[:, s0:s1].detach().requires_grad_(True)
-            expanded = expand_info_for_samples(
-                sub, s1 - s0, device, torch.float32
-            )
-            with torch.enable_grad():
-                grads, _ = action_objective_grads(model, expanded, actions)
-            sb_grads.append(
-                grads.detach()
-                .permute(1, 0, 2, 3)
-                .reshape(s1 - s0, ob, horizon * action_dim)
-                .to('cpu', torch.float64)
-            )
-        grad_chunks.append(torch.cat(sb_grads, dim=0))  # (N, ob, D)
+                cs_chunks = None
+    finally:
+        if orig_criterion is not None:
+            model.criterion = orig_criterion
 
     grads_all = torch.cat(grad_chunks, dim=1)  # (N, B, D)
+    costs_all = torch.cat(cost_chunks, dim=1)  # (N, B)
+    cost_sens = None
+    if cs_chunks:
+        try:
+            cost_sens = torch.cat(cs_chunks, dim=1)  # (N, B, D_lat)
+        except Exception:  # noqa: BLE001
+            cost_sens = None
+
+    aux = {
+        'cem_std_mean': cem_std_mean,
+        'cost_sens': cost_sens,
+        'n_obs': int(n_obs),
+    }
+    return grads_all, costs_all, aux
+
+
+def run_planning_esnr(
+    model,
+    info: dict,
+    *,
+    horizon: int,
+    action_dim: int,
+    num_samples: int,
+    var_scale: float,
+    seed: int,
+    device,
+    obs_batch: int = 1,
+    sample_batch: int = 16,
+    proposal: str = 'prior',
+    solver=None,
+    clear_caches: bool = True,
+) -> dict:
+    """Compute planning-ESNR for one checkpoint over a batch of observations.
+
+    Thin wrapper over :func:`collect_planning_grads`: collects the ``(N, B, D)``
+    action-gradient stack, then reduces it with :func:`compute_esnr_from_grads`.
+    The returned dict is unchanged from before the EPGQ refactor.
+
+    Returns:
+        :func:`compute_esnr_from_grads` dict, plus ``num_obs``, ``num_samples``,
+        ``var_scale``, ``proposal``, ``sample_batch``, ``cem_std_mean``.
+    """
+    grads_all, _costs, aux = collect_planning_grads(
+        model,
+        info,
+        horizon=horizon,
+        action_dim=action_dim,
+        num_samples=num_samples,
+        var_scale=var_scale,
+        seed=seed,
+        device=device,
+        obs_batch=obs_batch,
+        sample_batch=sample_batch,
+        proposal=proposal,
+        solver=solver,
+        clear_caches=clear_caches,
+        capture_cost_sens=False,
+    )
     out = compute_esnr_from_grads(grads_all)
     out.update(
-        num_obs=int(n_obs),
+        num_obs=int(aux['n_obs']),
         num_samples=int(num_samples),
         var_scale=float(var_scale),
         proposal=proposal,
         sample_batch=int(sample_batch),
-        cem_std_mean=cem_std_mean,
+        cem_std_mean=aux['cem_std_mean'],
     )
     return out
 
@@ -337,5 +459,6 @@ __all__ = [
     'sample_action_trajectories',
     'expand_info_for_samples',
     'action_objective_grads',
+    'collect_planning_grads',
     'run_planning_esnr',
 ]
