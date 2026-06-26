@@ -196,6 +196,7 @@ def collect_planning_grads(
     solver=None,
     clear_caches: bool = True,
     capture_cost_sens: bool = False,
+    return_actions: bool = False,
 ):
     """Collect the per-sample action-gradient stack for one checkpoint.
 
@@ -229,12 +230,19 @@ def collect_planning_grads(
             residual ``pred_emb - goal_emb`` (``d cost / d pred_emb``, up to the
             factor 2) by wrapping ``model.criterion``. Best-effort: ``None`` if
             the model has no compatible ``criterion``. Off by the ESNR path.
+        return_actions: also return the exact sampled action trajectories whose
+            costs are ``costs_all``, as ``aux['actions']`` of shape
+            ``(N, B, horizon, action_dim)`` float32 on CPU. Off by default
+            (``aux['actions']`` is ``None``); enabling it is purely additive and
+            does not change ``grads_all``/``costs_all``. Used by GCS-Align, which
+            re-rolls these SAME actions in the real env to score the model cost
+            surface against the true outcome.
 
     Returns:
         ``(grads_all, costs_all, aux)`` where ``grads_all`` is ``(N, B, D)``
         float64 on CPU, ``costs_all`` is ``(N, B)`` float64 on CPU, and ``aux``
         is ``{'cem_std_mean', 'cost_sens' (N, B, D_lat) float32 CPU or None,
-        'n_obs'}``.
+        'n_obs', 'actions' (N, B, H, A) float32 CPU or None}``.
     """
     if proposal not in ('prior', 'cem_optimized', 'cem_centered'):
         raise NotImplementedError(f"proposal '{proposal}' not implemented")
@@ -310,6 +318,7 @@ def collect_planning_grads(
     grad_chunks = []  # each (N, ob, D)
     cost_chunks = []  # each (N, ob)
     cs_chunks = [] if capture_cost_sens else None  # each (N, ob, D_lat)
+    act_chunks = [] if return_actions else None  # each (N, ob, H, A)
 
     try:
         for start in range(0, n_obs, obs_batch):
@@ -337,6 +346,14 @@ def collect_planning_grads(
                 center=center,
                 scale=scale,
             )
+            if act_chunks is not None:
+                # (ob, N, H, A) -> (N, ob, H, A); these are the EXACT actions
+                # whose costs are accumulated below, in the same (N, ob) order.
+                act_chunks.append(
+                    actions_full.detach()
+                    .permute(1, 0, 2, 3)
+                    .to('cpu', torch.float32)
+                )
 
             sb_grads = []  # each (sbn, ob, D)
             sb_costs = []  # each (sbn, ob)
@@ -391,10 +408,15 @@ def collect_planning_grads(
         except Exception:  # noqa: BLE001
             cost_sens = None
 
+    actions_all = None
+    if act_chunks:
+        actions_all = torch.cat(act_chunks, dim=1)  # (N, B, H, A)
+
     aux = {
         'cem_std_mean': cem_std_mean,
         'cost_sens': cost_sens,
         'n_obs': int(n_obs),
+        'actions': actions_all,
     }
     return grads_all, costs_all, aux
 

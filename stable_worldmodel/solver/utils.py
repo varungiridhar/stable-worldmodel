@@ -49,7 +49,12 @@ def prepare_init_action(
     if remaining <= 0:
         return init_action
 
-    if not isinstance(model, Actionable):
+    # A model may opt out of actor warm-start (``no_actor_warmstart=True``) so it
+    # is initialized exactly like the non-Actionable JEPA models (zero-pad) — the
+    # shared planning protocol for the cross-paradigm zoo, where no RL policy
+    # prior is used at inference. TD-MPC2 sets this for goal-conditioned planning.
+    no_actor = getattr(model, 'no_actor_warmstart', False)
+    if no_actor or not isinstance(model, Actionable):
         device = init_action.device if init_action is not None else 'cpu'
         tail = torch.zeros(n_envs, remaining, action_dim, device=device)
         if init_action is not None:

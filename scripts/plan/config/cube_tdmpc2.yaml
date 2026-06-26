@@ -1,0 +1,91 @@
+defaults:
+  - launcher: local
+  - solver: cem
+  - _self_
+
+# ── TD-MPC2 Cube planning/eval ───────────────────────────────────────────────
+# STATE-latent planning with an AUGMENTED-STATE goal, mirroring the TwoRoom
+# TD-MPC2 setup. The model encodes [observation, goal] (56-d) and plans with the
+# differentiable goal-MSE cost (get_cost_goal_mse). The CURRENT 28-d state comes
+# from the LIVE env step-info under `observation` (CubeEnv now exposes it every
+# step, like TwoRoom's `state`); the GOAL is the offset-ahead expert observation
+# `goal_observation` = observation[start+offset], produced by
+# World._extract_init_goal and re-injected each step (the env never overwrites a
+# `goal_*` key). Success is the SAME env metric as the JEPA configs: the cube
+# must reach within 0.04m of goal_privileged/block_0_pos (the cube position at
+# start+offset), set via set_target_pos.
+world:
+  env_name: swm/OGBCube-v0
+  num_envs: ${eval.num_eval}
+  max_episode_steps: ??? # set to 2*eval_budget by eval_wm.py
+  env_type: single
+  ob_type: states
+  multiview: False
+  width: 224
+  height: 224
+  visualize_info: False
+  terminate_at_goal: True
+
+seed: 42
+policy: random # ckpt dir (e.g. p3cubesmoke_tdmpc2_s0) or random
+
+# TD-MPC2 plans the goal-MSE cost (auto-selected when a goal is present).
+plan_cost: goal_mse
+
+plan_config:
+  horizon: 5
+  receding_horizon: 5
+  action_block: 5 # frameskip (base action_dim 5 -> packed 25 per horizon step)
+
+dataset:
+  stats: ${eval.dataset_name}
+  # State eval: load only low-dim columns (NO image columns). `observation` and
+  # `target` both loaded so the goal-MSE cost finds its goal regardless of how
+  # the checkpoint was trained (episode-final -> goal_observation; goal_col path
+  # -> target). action is z-scored by the eval `process`; observation/target are
+  # left RAW (TD-MPC2 z-scores the augmented state internally via stored stats).
+  keys_to_load:
+    - observation
+    - target
+    - action
+    - qpos
+    - qvel
+    - privileged/block_0_pos
+  keys_to_cache:
+    - action
+
+eval:
+  num_eval: 50
+  goal_offset_steps: 25
+  eval_budget: 50
+  img_size: 224
+  dataset_name: ogbench/cube_single_multiview_expert.lance
+  callables:
+    - method: set_state
+      args:
+        qpos:
+          value: qpos
+        qvel:
+          value: qvel
+    - method: set_target_pos
+      args:
+        cube_id:
+          value: 0
+          in_dataset: False
+        target_pos:
+          value: goal_privileged/block_0_pos
+
+output:
+  filename: cube_tdmpc2_results.txt
+
+esnr:
+  num_samples: 96
+  var_scale: 1.0
+  obs_batch: 1
+  sample_batch: 16
+  proposal: prior
+  out_csv: ./esnr_row.csv
+  train_seed: null
+  global_step: null
+  run_name: null
+  out_dir: ./esnr_rows

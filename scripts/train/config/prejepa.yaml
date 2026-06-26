@@ -10,6 +10,9 @@ hydra:
 output_model_name: pusht_${backbone.type}_p${predictor.size}
 subdir: null
 seed: 42
+# Optional logical->on-disk column remap (e.g. Cube: pixels -> pixels_front_pixels);
+# declared here so a plain `column_aliases={...}` CLI override works (struct mode).
+column_aliases: null
 
 # --- Checkpointing ---
 # epoch_interval: save every N epochs (+ always the final epoch).

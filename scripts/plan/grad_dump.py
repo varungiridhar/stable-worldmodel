@@ -96,10 +96,20 @@ def run(cfg: DictConfig):
         'pixels': img_transform(cfg, torch.float32),
         'goal': img_transform(cfg, torch.float32),
     }
+    _ds_extra = {}
+    _ktl = cfg.dataset.get('keys_to_load', None)
+    if _ktl is not None:
+        _ds_extra['keys_to_load'] = list(_ktl)
+    _aliases = cfg.dataset.get('column_aliases', None)
+    if _aliases is not None:
+        _ds_extra['column_aliases'] = OmegaConf.to_container(
+            _aliases, resolve=True
+        )
     dataset = swm.data.load_dataset(
         cfg.eval.dataset_name,
         cache_dir=cfg.get('cache_dir', None),
         keys_to_cache=list(cfg.dataset.keys_to_cache),
+        **_ds_extra,
     )
     col_name = _episode_col(dataset)
     ep_indices, _ = np.unique(
@@ -117,7 +127,9 @@ def run(cfg: DictConfig):
             process[f'goal_{c}'] = p
 
     # --- model in fp32 (no bf16): a variance ratio needs full precision ---
-    model = swm.wm.utils.load_pretrained(cfg.policy).to('cuda').eval()
+    # load_world_model handles BOTH the JEPA .pt state_dict format and the
+    # TD-MPC2 *_object.ckpt pickled-nn.Module format.
+    model = swm.wm.utils.load_world_model(cfg.policy).to('cuda').eval()
     model.requires_grad_(False)
     model.interpolate_pos_encoding = True
 

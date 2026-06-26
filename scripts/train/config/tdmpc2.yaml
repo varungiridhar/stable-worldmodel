@@ -11,9 +11,27 @@ output_model_name: tdmpc2_output
 subdir: null
 seed: 1
 
+# --- Checkpointing (dense ckpts for the v3 probe protocol) ---
+epoch_interval: 1          # save *_epoch_N_object.ckpt every N epochs
+step_interval: 0           # >0: uniform-cadence *_step_N_object.ckpt
+intra_epoch_steps: null    # one-shot global-step thresholds (early training)
+intra_epoch_max_epoch: 0   # only fire intra_epoch_steps below this epoch
+
+# --- Planning cost path ---
+# goal_mse  : differentiable goal-conditioned latent-MSE cost (PLAN+PROBE here)
+# reward_value: native TD-MPC2 reward/value cost
+# null      : auto -> goal_mse when a goal is present in the info_dict
+plan_cost: null
+
 # --- Data ---
 dataset_name: null
 goal_obs_key: state
+# goal_col: when set (e.g. Cube `target`), augment goal_obs_key with this
+# per-step column as the goal instead of each episode's FINAL obs (TwoRoom
+# default, null). Note: for the Cube SMOKE we use the TwoRoom-style episode-
+# final path (goal_col=null) because the live CubeEnv overwrites info['target']
+# each step, whereas info['goal_observation'] is stable.
+goal_col: null
 cache_dir: null
 cache_dataset: true
 batch_size: 256

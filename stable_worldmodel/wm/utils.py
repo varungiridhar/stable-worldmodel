@@ -94,6 +94,53 @@ def load_pretrained(name: str, cache_dir: str = None, extra_args=None):
     return model
 
 
+def load_world_model(name: str, cache_dir: str = None):
+    """Load a world model across BOTH checkpoint formats used in this repo.
+
+    * **JEPA** — a ``.pt`` state_dict beside a ``config.json`` (Hydra
+      ``_target_``). Delegates to :func:`load_pretrained` (the original path).
+    * **TD-MPC2** — a ``*_object.ckpt`` produced by ``torch.save(model)`` (a
+      pickled ``nn.Module``). Detected by the ``_object.ckpt`` suffix; loaded
+      with ``torch.load`` and scanned for the module exposing ``get_cost``
+      (mirrors :func:`stable_worldmodel.policy.AutoCostModel`).
+
+    Local names resolve relative to ``<cache_dir>/checkpoints/`` (matching the
+    other loaders). Use this from eval/probe scripts so a single call handles
+    every paradigm in the model zoo.
+    """
+    ckpt_root = get_cache_dir(cache_dir, sub_folder='checkpoints')
+    cand = Path(name)
+    resolved = cand if cand.exists() else (ckpt_root / name)
+
+    if str(resolved).endswith('_object.ckpt'):
+        if not resolved.exists():
+            raise FileNotFoundError(f'Checkpoint not found: {resolved}')
+        obj = torch.load(resolved, weights_only=False, map_location='cpu')
+
+        def _scan(module):
+            if hasattr(module, 'get_cost'):
+                return (
+                    module.eval()
+                    if isinstance(module, torch.nn.Module)
+                    else module
+                )
+            if isinstance(module, torch.nn.Module):
+                for child in module.children():
+                    found = _scan(child)
+                    if found is not None:
+                        return found
+            return None
+
+        model = _scan(obj)
+        if model is None:
+            raise RuntimeError(
+                f"No module with 'get_cost' found in {resolved}"
+            )
+        return model
+
+    return load_pretrained(name, cache_dir=cache_dir)
+
+
 def _resolve(name: str, cache_dir: Path) -> tuple[Path, dict]:
     """Return ``(checkpoint_path, config_dict)`` for *name*.
 
@@ -182,4 +229,4 @@ def _load_config(folder: Path) -> dict:
         return json.load(f)
 
 
-__all__ = ['load_pretrained', 'save_pretrained']
+__all__ = ['load_pretrained', 'load_world_model', 'save_pretrained']

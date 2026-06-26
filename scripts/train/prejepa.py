@@ -199,6 +199,17 @@ def run(cfg):
     encoding_keys = list(cfg.wm.get('encoding', {}).keys())
     keys_to_load = ['pixels'] + encoding_keys
 
+    # Optional column aliasing (default-absent -> unchanged PushT/TwoRoom
+    # behavior). Cube needs it: `pixels` is an alias for the on-disk
+    # front-camera column (`pixels_front_pixels`). Encoding keys for Cube are
+    # just {action} (pixels + action), so no proprio merge is needed here.
+    extra_load = {}
+    aliases = cfg.get('column_aliases', None)
+    if aliases is not None:
+        extra_load['column_aliases'] = OmegaConf.to_container(
+            aliases, resolve=True
+        )
+
     cache_dir = os.environ.get('LOCAL_DATASET_DIR', None)
     print(
         f'Loading dataset "{cfg.dataset_name}" from {"local cache: " + cache_dir if cache_dir else "default location"}'
@@ -211,6 +222,7 @@ def run(cfg):
         cache_dir=cache_dir,
         keys_to_load=keys_to_load,
         keys_to_cache=encoding_keys,
+        **extra_load,
     )
 
     normalizers = [

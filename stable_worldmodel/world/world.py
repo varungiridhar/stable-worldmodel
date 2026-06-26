@@ -198,6 +198,7 @@ class World:
         goal_offset: int | None = None,
         eval_budget: int | None = None,
         callables: list[dict] | None = None,
+        native_task_ids: list[int] | None = None,
     ) -> dict:
         """Run the attached policy and return aggregated metrics.
 
@@ -234,6 +235,13 @@ class World:
                 'in_dataset': bool}}}``; if ``in_dataset`` is True, the
                 ``value`` names a key in the sliced dataset state and the
                 per-env value is deep-copied in.
+            native_task_ids: Optional list (one per env) of native task ids.
+                When provided (dataset mode only), the goal image + success
+                target are taken from the env's fixed native task goal
+                (``env.set_native_task(task_id)``) instead of from the future
+                dataset frame; the init/start state still comes from the
+                dataset via ``callables``. Used for OGBench Cube native-goal
+                eval (``eval.goal_mode=native``).
 
         Returns:
             A dict with ``'success_rate'`` (percent), ``'episode_successes'``
@@ -250,6 +258,7 @@ class World:
                 callables,
                 video,
                 mode,
+                native_task_ids=native_task_ids,
             )
         mode = reset_mode or 'auto'
         return self._evaluate(episodes, seed, options, video, mode)
@@ -499,6 +508,7 @@ class World:
         callables,
         video,
         mode,
+        native_task_ids=None,
     ) -> dict:
         n = len(episodes_idx)
         assert n == self.num_envs
@@ -519,6 +529,24 @@ class World:
                 _apply_callables(
                     self.envs.envs[i].unwrapped, callables, env_init
                 )
+
+        # NATIVE-GOAL override: the start/init state is already set above (via the
+        # set_state callable); here we replace the GOAL source with the env's
+        # fixed native task goal. set_native_task sets the success mocap target on
+        # each unwrapped env AND returns the rendered goal image. We overwrite
+        # goal_state['goal'] with these images so they flow through the SAME
+        # broadcast -> goal_snapshot -> per-step re-injection path as the offset
+        # goal image (identical shape/dtype/key for the planner + grad probe).
+        if native_task_ids is not None:
+            assert len(native_task_ids) == n, (
+                'native_task_ids must have one entry per eval env'
+            )
+            native_goals = []
+            for i in range(n):
+                env = self.envs.envs[i].unwrapped
+                goal_img = env.set_native_task(int(native_task_ids[i]))
+                native_goals.append(np.asarray(goal_img))
+            goal_state['goal'] = np.stack(native_goals)
 
         shape_prefix = self.infos['pixels'].shape[:2]
         for src, dst_prefix in [(init_state, ''), (goal_state, '')]:

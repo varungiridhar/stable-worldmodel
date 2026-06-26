@@ -142,6 +142,12 @@ class LanceDataset(Dataset):
         connect_kwargs: forwarded to :func:`lancedb.connect` (e.g. S3 creds).
     """
 
+    # Class-level fallback so an object pickled before ``column_aliases`` existed
+    # (e.g. a persistent DataLoader worker that re-imports an updated module
+    # mid-run) degrades to "no aliases" instead of raising AttributeError.
+    # ``__init__`` always sets the per-instance value.
+    _aliases: dict[str, str] = {}
+
     def __init__(
         self,
         path: str | Path | None = None,
@@ -155,6 +161,7 @@ class LanceDataset(Dataset):
         keys_to_cache: list[str] | None = None,
         keys_to_merge: dict[str, list[str] | str] | None = None,
         image_columns: list[str] | None = None,
+        column_aliases: dict[str, str] | None = None,
         episode_index_column: str = 'episode_idx',
         step_index_column: str = 'step_idx',
         connect_kwargs: dict[str, Any] | None = None,
@@ -174,6 +181,15 @@ class LanceDataset(Dataset):
         self._cache: dict[str, np.ndarray] = {}
         self._perm = None
         self._fetch_columns: list[str] | None = None
+        # Logical-name -> on-disk-column map. Lets a config expose an on-disk
+        # column under a different name the rest of the pipeline expects (e.g.
+        # the Cube multiview dataset stores the front-camera view under
+        # ``pixels_front_pixels`` but the JEPA pipeline / goal-image slicing in
+        # ``World._extract_init_goal`` require a column literally named
+        # ``pixels``). Identity for every non-aliased key. All public surfaces
+        # (``column_names``, samples, ``get_col_data``) use the LOGICAL name;
+        # only the Lance fetch / schema lookups translate to the on-disk name.
+        self._aliases: dict[str, str] = dict(column_aliases or {})
 
         _force_forkserver()
         table = self._connect_table()
@@ -187,7 +203,18 @@ class LanceDataset(Dataset):
             )
 
         self._keys = keys_to_load or available
-        missing = [k for k in self._keys if k not in available]
+        # Validate aliases point at real on-disk columns; logical keys are then
+        # checked against (available ∪ alias-logical-names).
+        bad_alias = {
+            k: v for k, v in self._aliases.items() if v not in available
+        }
+        if bad_alias:
+            raise KeyError(
+                f'column_aliases point at missing on-disk columns {bad_alias} '
+                f"in Lance table '{resolved_name}'"
+            )
+        valid_names = set(available) | set(self._aliases)
+        missing = [k for k in self._keys if k not in valid_names]
         if missing:
             raise KeyError(
                 f"Columns {missing} missing from Lance table '{resolved_name}'"
@@ -198,11 +225,13 @@ class LanceDataset(Dataset):
             for f in table.schema
             if pa.types.is_binary(f.type) or pa.types.is_large_binary(f.type)
         }
-        self.image_columns = (
-            binary_cols & set(self._keys)
-            if image_columns is None
-            else {c for c in image_columns if c in self._keys}
-        )
+        if image_columns is None:
+            # A logical key is an image column iff its on-disk source is binary.
+            self.image_columns = {
+                k for k in self._keys if self._ondisk(k) in binary_cols
+            }
+        else:
+            self.image_columns = {c for c in image_columns if c in self._keys}
 
         lengths, offsets = self._compute_episode_structure(table)
 
@@ -228,6 +257,11 @@ class LanceDataset(Dataset):
     @property
     def column_names(self) -> list[str]:
         return list(self._keys)
+
+    def _ondisk(self, key: str) -> str:
+        """Translate a logical key to its on-disk column name (identity if not
+        aliased)."""
+        return self._aliases.get(key, key)
 
     def __getstate__(self) -> dict:
         state = self.__dict__.copy()
@@ -308,7 +342,9 @@ class LanceDataset(Dataset):
 
     def _load_full_column(self, table, key: str) -> np.ndarray:
         data: list[np.ndarray] = []
-        reader = table.to_lance().scanner(columns=[key]).to_reader()
+        reader = (
+            table.to_lance().scanner(columns=[self._ondisk(key)]).to_reader()
+        )
         for batch in reader:
             values = self._batch_column_pylist(batch, key)
             if not values:
@@ -329,9 +365,13 @@ class LanceDataset(Dataset):
             return
         if self._perm is None:
             table = self._connect_table()
+            # Lance selects by on-disk column names; the batch it returns is
+            # then keyed on-disk, and _batch_column_pylist/_extract_column
+            # translate the logical key back to on-disk for the field lookup.
+            ondisk = [self._ondisk(k) for k in self._fetch_columns]
             self._perm = (
                 Permutation.identity(table)
-                .select_columns(self._fetch_columns)
+                .select_columns(ondisk)
                 .with_format('arrow')
             )
 
@@ -342,13 +382,13 @@ class LanceDataset(Dataset):
         return self._perm.__getitems__(rows)
 
     def _batch_column_pylist(self, batch, key: str) -> list[Any]:
-        idx = batch.schema.get_field_index(key)
+        idx = batch.schema.get_field_index(self._ondisk(key))
         if idx == -1:
             raise KeyError(f"Column '{key}' not found in batch")
         return batch.column(idx).to_pylist()
 
     def _extract_column(self, batch, key: str):
-        col_idx = batch.schema.get_field_index(key)
+        col_idx = batch.schema.get_field_index(self._ondisk(key))
         if col_idx == -1:
             raise KeyError(f"Column '{key}' not found in batch")
         col = batch.column(col_idx)

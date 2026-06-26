@@ -1,0 +1,20 @@
+# JEPA (PLDM / LeWM) training data for the OGBench Cube single task.
+# Mirrors data/tworoom.yaml but sources the multiview Cube .lance:
+#   * `pixels` is aliased to the on-disk `pixels_front_pixels` column (the
+#     front_pixels camera) — the SAME view the env renders live at eval, so the
+#     dataset-sliced goal image matches eval-time pixels (verified by the
+#     camera-match diagnostic). The other on-disk image columns (pixels_front,
+#     pixels_side*) are NOT loaded.
+#   * proprio is omitted: PLDM/LeWM run with wm.use_proprio=False, so they
+#     consume only pixels + action — uniform with the PreJEPA Cube smoke.
+dataset:
+  num_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}
+  frameskip: 5
+  name: ogbench/cube_single_multiview_expert.lance
+  column_aliases:
+    pixels: pixels_front_pixels
+  keys_to_load:
+    - pixels
+    - action
+  keys_to_cache:
+    - action

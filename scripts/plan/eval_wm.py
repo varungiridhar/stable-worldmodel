@@ -59,10 +59,24 @@ def get_episodes_length(dataset, episodes):
 
 
 def get_dataset(cfg, dataset_name):
+    # Optional knobs (default None -> reader loads all columns, matching the
+    # original TwoRoom/PushT behavior). Cube restricts keys_to_load so the heavy
+    # multiview image columns aren't decoded, and aliases its front-camera view
+    # to the logical `pixels` name the goal-image pipeline expects.
+    extra = {}
+    keys_to_load = cfg.dataset.get('keys_to_load', None)
+    if keys_to_load is not None:
+        extra['keys_to_load'] = list(keys_to_load)
+    column_aliases = cfg.dataset.get('column_aliases', None)
+    if column_aliases is not None:
+        extra['column_aliases'] = OmegaConf.to_container(
+            column_aliases, resolve=True
+        )
     dataset = swm.data.load_dataset(
         dataset_name,
         cache_dir=cfg.get('cache_dir', None),
         keys_to_cache=list(cfg.dataset.keys_to_cache),
+        **extra,
     )
     return dataset
 
@@ -110,7 +124,9 @@ def run(cfg: DictConfig):
     policy = cfg.get('policy', 'random')
 
     if policy != 'random':
-        model = swm.wm.utils.load_pretrained(cfg.policy)
+        # load_world_model handles BOTH the JEPA .pt state_dict format and the
+        # TD-MPC2 *_object.ckpt pickled-nn.Module format.
+        model = swm.wm.utils.load_world_model(cfg.policy)
         if cfg.get('bf16', False):
             model = model.to(torch.bfloat16)
         model = model.to('cuda')
@@ -143,6 +159,36 @@ def run(cfg: DictConfig):
         if cfg.policy != 'random'
         else Path(__file__).parent
     )
+
+    # -- GOAL SOURCE: offset (default, legacy) vs native (fixed OGBench tasks).
+    # In native mode the GOAL image + success target come from the env's native
+    # task goals (set_native_task); the start/init state still comes from the
+    # dataset, so we keep the set_state callable but DROP set_target_pos (the
+    # native call sets the target). Task ids are cycled across the eval envs.
+    goal_mode = cfg.eval.get('goal_mode', 'offset')
+    native_task_ids = None
+    eval_callables = OmegaConf.to_container(
+        cfg.eval.get('callables'), resolve=True
+    )
+    if goal_mode == 'native':
+        task_ids = list(cfg.eval.get('task_ids', [0]))
+        native_task_ids = [
+            task_ids[i % len(task_ids)] for i in range(cfg.eval.num_eval)
+        ]
+        if eval_callables:
+            eval_callables = [
+                c
+                for c in eval_callables
+                if c.get('method') != 'set_target_pos'
+            ]
+        print(
+            f'[eval] goal_mode=native; cycling task_ids={task_ids} '
+            f'across {cfg.eval.num_eval} envs'
+        )
+    elif goal_mode != 'offset':
+        raise ValueError(
+            f"eval.goal_mode must be 'offset' or 'native', got {goal_mode!r}"
+        )
 
     # sample the episodes and the starting indices
     episode_len = get_episodes_length(dataset, ep_indices)
@@ -223,8 +269,11 @@ def run(cfg: DictConfig):
                 goal_offset=cfg.eval.goal_offset_steps,
                 eval_budget=cfg.eval.eval_budget,
                 episodes_idx=eval_episodes.tolist()[:n],
-                callables=OmegaConf.to_container(
-                    cfg.eval.get('callables'), resolve=True
+                callables=eval_callables,
+                native_task_ids=(
+                    native_task_ids[:n]
+                    if native_task_ids is not None
+                    else None
                 ),
                 video=results_path,
             )
@@ -238,9 +287,8 @@ def run(cfg: DictConfig):
             goal_offset=cfg.eval.goal_offset_steps,
             eval_budget=cfg.eval.eval_budget,
             episodes_idx=eval_episodes.tolist(),
-            callables=OmegaConf.to_container(
-                cfg.eval.get('callables'), resolve=True
-            ),
+            callables=eval_callables,
+            native_task_ids=native_task_ids,
             video=results_path,
         )
     end_time = time.time()

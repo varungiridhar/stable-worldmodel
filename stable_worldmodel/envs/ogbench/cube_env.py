@@ -185,6 +185,11 @@ class CubeEnv(ManipSpaceEnv):
         # The target cube position is stored in the mocap object.
         self._target_block = 0
 
+        # Native-goal eval bookkeeping (see set_native_task). Defaults are set
+        # here so freshly constructed envs are well-defined; getattr-safe access
+        # in set_native_task keeps older pickled envs/checkpoints working.
+        self._cur_task_id = None
+
         default_start_position = np.array([0.3, 0.0], dtype=np.float64)
 
         self.variation_space = swm_spaces.Dict(
@@ -1358,6 +1363,87 @@ class CubeEnv(ManipSpaceEnv):
             self._data.mocap_quat[mocap_id] = target_quat
         # mujoco.mj_forward(self._model, self._data)
 
+    def set_native_task(self, task_id):
+        """Set the env's success target + render a goal image for a NATIVE task.
+
+        OGBench Cube ships fixed native task goals (designated target cube
+        configurations) in ``self.task_infos`` (see :meth:`set_tasks`). This
+        method wires one of those native goals into the env WITHOUT touching the
+        current physics state (it is fully state-side-effect free): it points
+        every cube's success mocap target at ``task_infos[task_id]['goal_xyzs']``
+        and returns an RGB image of the cubes placed at that goal, rendered from
+        the same camera/size as a normal observation (front_pixels, HxW).
+
+        Unlike the dataset/offset goal path, the START state is NOT set here —
+        callers are expected to set the init/start state separately (e.g. via the
+        ``set_state`` callable from the dataset). Only the GOAL (success target +
+        goal image) is established by this call.
+
+        The save -> place-cubes-at-goal -> mj_forward -> render -> restore pattern
+        mirrors :meth:`initialize_episode` (task mode) exactly so that no qpos /
+        qvel / mocap state leaks out of this call.
+
+        Args:
+            task_id (int): Index into ``self.task_infos`` (0..len-1).
+
+        Returns:
+            ndarray: The rendered goal image, RGB ``uint8`` array of shape
+                ``(H, W, 3)`` (the front_pixels camera at the env's configured
+                height/width, e.g. ``(224, 224, 3)``). Byte-for-byte the same
+                shape/dtype/layout as a normal ``render()`` / ``info['pixels']``
+                frame so it is interchangeable with the dataset goal image.
+
+        Raises:
+            ValueError: If ``task_id`` is out of range for ``self.task_infos``.
+        """
+        task_infos = getattr(self, 'task_infos', None)
+        if not task_infos:
+            raise ValueError(
+                'No task_infos defined; cannot set a native task.'
+            )
+        if task_id < 0 or task_id >= len(task_infos):
+            raise ValueError(
+                f'task_id out of range (maximum {len(task_infos) - 1})'
+            )
+
+        self._cur_task_id = task_id
+        goal_xyzs = np.asarray(
+            task_infos[task_id]['goal_xyzs'], dtype=np.float64
+        )
+
+        # Save the full simulator state so the physics state is side-effect free.
+        saved_qpos = self._data.qpos.copy()
+        saved_qvel = self._data.qvel.copy()
+
+        # Point each cube's success mocap target at the native goal position and
+        # place the cube bodies there so the rendered image depicts the goal.
+        identity_wxyz = lie.SO3.identity().wxyz.tolist()
+        for i in range(self._num_cubes):
+            self.set_target_pos(i, goal_xyzs[i])
+            self._data.joint(f'object_joint_{i}').qpos[:3] = goal_xyzs[i]
+            self._data.joint(f'object_joint_{i}').qpos[3:] = identity_wxyz
+        mujoco.mj_forward(self._model, self._data)
+
+        # Render the goal image (same camera/size as a normal observation).
+        goal_rendered = self.render()
+        # Guarantee byte-for-byte parity with the dataset goal image: an RGB
+        # uint8 HWC, C-contiguous array. render() already returns this, but the
+        # normalization makes the contract explicit and robust.
+        goal_rendered = np.ascontiguousarray(goal_rendered, dtype=np.uint8)
+        self._cur_goal_rendered = goal_rendered
+
+        # Restore the cube + arm physics (qpos/qvel) so the start state is
+        # untouched. The success mocap targets are DELIBERATELY left pointing at
+        # the native goal (set above) — that is the whole point of this call —
+        # so re-apply them after the qpos/qvel restore + forward.
+        self._data.qpos[:] = saved_qpos
+        self._data.qvel[:] = saved_qvel
+        for i in range(self._num_cubes):
+            self.set_target_pos(i, goal_xyzs[i])
+        mujoco.mj_forward(self._model, self._data)
+
+        return goal_rendered
+
     def post_step(self):
         """Update environment state after each simulation step.
 
@@ -1433,6 +1519,41 @@ class CubeEnv(ManipSpaceEnv):
         ob_info['target'] = self._cur_goal_ob
         ob_info['success'] = self._success
         return ob_info
+
+    def _compute_state_vector(self):
+        """The 28-d low-dim state vector, independent of ``_ob_type``.
+
+        Equals ``compute_observation()`` when ``ob_type != 'pixels'``. Exposed in
+        the step/reset info dict under ``observation`` so a STATE-conditioned
+        planner (e.g. TD-MPC2's goal-MSE cost) always sees the LIVE current state
+        each replan — even when the env renders pixels for the JEPA models. The
+        TwoRoom env analogously exposes a live ``state`` in its info dict.
+        """
+        xyz_center = np.array([0.425, 0.0, 0.0])
+        xyz_scaler = 10.0
+        gripper_scaler = 3.0
+
+        ob_info = self.compute_ob_info()
+        ob = [
+            ob_info['proprio/joint_pos'],
+            ob_info['proprio/joint_vel'],
+            (ob_info['proprio/effector_pos'] - xyz_center) * xyz_scaler,
+            np.cos(ob_info['proprio/effector_yaw']),
+            np.sin(ob_info['proprio/effector_yaw']),
+            ob_info['proprio/gripper_opening'] * gripper_scaler,
+            ob_info['proprio/gripper_contact'],
+        ]
+        for i in range(self._num_cubes):
+            ob.extend(
+                [
+                    (ob_info[f'privileged/block_{i}_pos'] - xyz_center)
+                    * xyz_scaler,
+                    ob_info[f'privileged/block_{i}_quat'],
+                    np.cos(ob_info[f'privileged/block_{i}_yaw']),
+                    np.sin(ob_info[f'privileged/block_{i}_yaw']),
+                ]
+            )
+        return np.concatenate(ob)
 
     def add_object_info(self, ob_info):
         """Add cube-specific information to the observation info dictionary.
@@ -1512,32 +1633,7 @@ class CubeEnv(ManipSpaceEnv):
         if self._ob_type == 'pixels':
             return self.get_pixel_observation()
         else:
-            xyz_center = np.array([0.425, 0.0, 0.0])
-            xyz_scaler = 10.0
-            gripper_scaler = 3.0
-
-            ob_info = self.compute_ob_info()
-            ob = [
-                ob_info['proprio/joint_pos'],
-                ob_info['proprio/joint_vel'],
-                (ob_info['proprio/effector_pos'] - xyz_center) * xyz_scaler,
-                np.cos(ob_info['proprio/effector_yaw']),
-                np.sin(ob_info['proprio/effector_yaw']),
-                ob_info['proprio/gripper_opening'] * gripper_scaler,
-                ob_info['proprio/gripper_contact'],
-            ]
-            for i in range(self._num_cubes):
-                ob.extend(
-                    [
-                        (ob_info[f'privileged/block_{i}_pos'] - xyz_center)
-                        * xyz_scaler,
-                        ob_info[f'privileged/block_{i}_quat'],
-                        np.cos(ob_info[f'privileged/block_{i}_yaw']),
-                        np.sin(ob_info[f'privileged/block_{i}_yaw']),
-                    ]
-                )
-
-            return np.concatenate(ob)
+            return self._compute_state_vector()
 
     def compute_oracle_observation(self):
         """Compute oracle goal representation containing only cube positions.

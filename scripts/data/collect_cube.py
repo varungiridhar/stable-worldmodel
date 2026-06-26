@@ -1,7 +1,9 @@
 import os
 from pathlib import Path
 
-os.environ['MUJOCO_GL'] = 'glfw'
+os.environ.setdefault(
+    'MUJOCO_GL', 'egl'
+)  # headless GPU rendering on the cluster (glfw needs a display)
 import hydra
 import numpy as np
 from loguru import logger as logging
@@ -35,7 +37,7 @@ def run(cfg: DictConfig):
     world.collect(
         Path(cfg.cache_dir or swm.data.utils.get_cache_dir())
         / 'datasets'
-        / 'ogbench/cube_single_multiview_expert.lance',
+        / cfg.get('out_subpath', 'ogbench/cube_single_multiview_expert.lance'),
         episodes=cfg.num_traj,
         seed=rng.integers(0, 1_000_000).item(),
         options=options,

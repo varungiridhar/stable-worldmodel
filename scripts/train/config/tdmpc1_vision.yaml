@@ -1,0 +1,110 @@
+# Vision-only TD-MPC1 config — the "regularizer-OFF" test bed. Identical to
+# tdmpc2_vision.yaml (pixels {pixels:128}, image_size 64, plan_cost
+# goal_image_mse, same tworoom_expert.lance pixels) EXCEPT the primary
+# collapse-PREVENTING regularizer is turned OFF: wm.use_simnorm=false. That
+# swaps TD-MPC2's per-simplex-softmax SimNorm (on BOTH the encoder output and
+# the dynamics activation) for a plain LayerNorm — recovering the original
+# TD-MPC1 (which has no SimNorm).
+#
+# Scientific question: on the low-anchor TwoRoom task, vision TD-MPC2 is a
+# DEGENERATE planner (degenerate_frac~0.96, ~6% success) — we believe SimNorm
+# SATURATION kills the planning action-gradients. Does removing SimNorm give
+# TD-MPC1 NON-degenerate planning gradients (degenerate_frac < 0.5), so the v3
+# metric's VARIANCE term ranks it rather than its degeneracy guard? Either way
+# it is a useful cross-paradigm data point.
+#
+# Differences from tdmpc2_vision.yaml:
+#   * wm.use_simnorm: false   (SimNorm -> LayerNorm; the TD-MPC1 ablation)
+# Everything else (encoder, planning cost, dataset, optimizer) is unchanged so
+# the comparison isolates the regularizer.
+defaults:
+  - _self_
+  - launcher: local
+
+hydra:
+  job:
+    chdir: true
+
+# --- Run ---
+output_model_name: tdmpc2_output
+subdir: null
+seed: 1
+
+# --- Checkpointing (dense ckpts for the v3 probe protocol) ---
+epoch_interval: 1          # save *_epoch_N_object.ckpt every N epochs
+step_interval: 0           # >0: uniform-cadence *_step_N_object.ckpt
+intra_epoch_steps: null    # one-shot global-step thresholds (early training)
+intra_epoch_max_epoch: 0   # only fire intra_epoch_steps below this epoch
+
+# --- Planning cost path ---
+# goal_image_mse : differentiable PLAIN pixel goal-image-MSE cost (PLAN+PROBE
+#                  here): encode goal image -> goal latent; roll dynamics under
+#                  the action candidates; latent-MSE of final rollout to goal.
+plan_cost: goal_image_mse
+
+# --- Data ---
+dataset_name: null
+goal_obs_key: null         # NO augmented-state goal-conditioning (vision-only)
+goal_col: null
+cache_dir: null
+cache_dataset: true
+batch_size: 256
+num_workers: 16
+train_split: 0.9
+image_size: 64             # TD-MPC2 native; the .lance pixels are resized to 64
+
+# --- Planning / MPPI parameters used only during evaluation ---
+mpc: true
+iterations: 12
+num_samples: 1024
+num_elites: 64
+num_pi_trajs: 256
+min_std: 0.01
+max_std: 0.1
+temperature: 0.5
+
+# --- World Model ---
+wm:
+  use_simnorm: false       # TD-MPC1 ablation: SimNorm -> LayerNorm (the test bed)
+  horizon: 5
+  mlp_dim: 384
+  enc_dim: 256
+  simnorm_dim: 8           # unused when use_simnorm=false (kept for parity)
+  num_q: 5
+  rho: 0.5
+  tau: 0.01
+  consistency_coef: 20.0
+  reward_coef: 0.1
+  value_coef: 0.1
+  discount: 0.99
+  uncertainty_penalty: 0.5
+  entropy_coef: 1e-4
+  name: tdmpc2
+
+  num_bins: 101
+  vmin: -6
+  vmax: 2
+
+  encoding:
+    pixels: 128
+
+# --- Optimizer ---
+optimizer:
+  type: AdamW
+  lr: 3e-4
+enc_lr_scale: 0.3
+
+# --- Trainer ---
+trainer:
+  max_epochs: 250
+  strategy: auto
+  devices: 1
+  accelerator: gpu
+  precision: 16-mixed
+  gradient_clip_val: 20.0
+
+# --- Logging ---
+wandb:
+  enable: True
+  project: null
+  entity: null

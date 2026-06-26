@@ -47,6 +47,20 @@ class TDMPC2(nn.Module):
         self.cfg = cfg
         self.scale = RunningScale(cfg.wm.tau)
 
+        # --- SimNorm toggle (the "regularizer-off" TD-MPC1 ablation) ----------
+        # TD-MPC2's SimNorm (a per-simplex softmax on the encoder output AND the
+        # dynamics activation) is the primary collapse-PREVENTING regularizer.
+        # The hypothesis (see tdmpc1_vision.yaml) is that on a low-anchor task
+        # SimNorm SATURATES and kills the planning action-gradients. Setting
+        # ``cfg.wm.use_simnorm=False`` turns it into TD-MPC1 (no SimNorm): we
+        # replace SimNorm with a plain LayerNorm in BOTH the encoder output and
+        # the dynamics activation — keeping the latent magnitude bounded (so the
+        # latent-MSE planning cost stays well-scaled) WITHOUT the softmax
+        # simplex that saturates. DEFAULTS to True == the unchanged TD-MPC2
+        # behavior, so existing checkpoints/jobs are unaffected. (A ``getattr``
+        # fallback elsewhere covers pickled models predating this flag.)
+        self.use_simnorm = cfg.wm.get('use_simnorm', True)
+
         encoding_cfg = cfg.wm.get('encoding', {})
         self.use_pixels = 'pixels' in encoding_cfg
         self.latent_dim = 0
@@ -95,14 +109,21 @@ class TDMPC2(nn.Module):
             'Model must have pixels or at least one extra_encoder defined.'
         )
 
-        self.sim_norm = SimNorm(cfg)
+        # Latent normalizer applied to BOTH the encoder output and (as the
+        # final dynamics activation). SimNorm when use_simnorm (TD-MPC2), else a
+        # plain LayerNorm over the full latent (TD-MPC1 "regularizer-off"). The
+        # encoder one is a stored module (``sim_norm`` name kept so the train
+        # script's enc-optimizer regex and any checkpoint keys still match —
+        # LayerNorm adds learnable params under that name, which is fine).
+        self.sim_norm = self._make_latent_norm(cfg)
 
-        # Latent dynamics model: predicts next latent state z' from (z, a)
+        # Latent dynamics model: predicts next latent state z' from (z, a).
+        # Same normalizer family as the encoder for its final activation.
         self.dynamics = mlp(
             self.latent_dim + cfg.action_dim,
             cfg.wm.mlp_dim,
             self.latent_dim,
-            act=SimNorm(cfg),
+            act=self._make_latent_norm(cfg),
         )
 
         # Reward predictor: predicts expected reward from (z, a) as a two-hot distribution
@@ -139,8 +160,90 @@ class TDMPC2(nn.Module):
         for q in self.target_qs:
             zero_init([q[-1].weight])
 
+        # --- Goal-conditioned latent-MSE planning support ---------------------
+        # When the model is goal-conditioned by concatenating the goal into a
+        # state encoding key (cfg.goal_obs_key, e.g. 'state' for TwoRoom: the
+        # train script augments state s -> [s, g]), planning/probing in this repo
+        # uses a *differentiable goal-MSE* cost in the AUGMENTED latent space
+        # (see ``get_cost_goal_mse``) instead of the native reward/value cost.
+        # The dataset state/goal columns are RAW (un-normalized) at eval time
+        # (the plan config does not z-score 'state'/'goal_state'), but training
+        # z-scores the augmented state. We therefore stash the training z-score
+        # stats of the augmented state as buffers so ``get_cost_goal_mse`` can
+        # normalize the states it constructs from the raw info_dict identically.
+        # ``state_mean/std`` cover the FULL augmented vector ([s, g], dim 2*D);
+        # registered as length-0 placeholders so they round-trip through pickle
+        # and ``load_state_dict`` even before ``set_state_norm`` is called.
+        self.goal_obs_key = cfg.get('goal_obs_key')
+        # Opt out of CEM actor warm-start so planning is initialized identically
+        # to the (non-Actionable) JEPA models — zero-padded, NO RL policy prior
+        # at inference (the shared cross-paradigm protocol). Override via
+        # cfg.no_actor_warmstart=False to use the TD-MPC2 actor warm-start.
+        self.no_actor_warmstart = cfg.get('no_actor_warmstart', True)
+        self.register_buffer(
+            'state_mean', torch.zeros(0, dtype=torch.float32), persistent=True
+        )
+        self.register_buffer(
+            'state_std', torch.ones(0, dtype=torch.float32), persistent=True
+        )
+
+    def _make_latent_norm(self, cfg) -> nn.Module:
+        """Build the latent normalizer: SimNorm (TD-MPC2) or LayerNorm (TD-MPC1).
+
+        When ``cfg.wm.use_simnorm`` (default True) this is the standard TD-MPC2
+        SimNorm (per-simplex softmax). When False — the TD-MPC1 "regularizer-off"
+        ablation — it is a plain ``LayerNorm`` over the full latent dimension,
+        which bounds the latent scale (so the latent-MSE planning cost stays
+        well-conditioned) WITHOUT the softmax simplex that saturates the
+        action-gradients. Used identically for the encoder output and the
+        dynamics' final activation.
+        """
+        if getattr(self, 'use_simnorm', True):
+            return SimNorm(cfg)
+        return nn.LayerNorm(self.latent_dim)
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        """Resize the (possibly length-0) norm buffers to the checkpoint's.
+
+        ``state_mean``/``state_std`` are registered as length-0 placeholders, so
+        a fresh model loaded via ``instantiate(config) + load_state_dict`` (the
+        JEPA path) would otherwise hit a size mismatch against the saved length-
+        ``2*D`` stats. Resize to match before the standard copy runs.
+        """
+        for name in ('state_mean', 'state_std'):
+            key = prefix + name
+            if key in state_dict:
+                buf = getattr(self, name)
+                src = state_dict[key]
+                if buf is not None and buf.shape != src.shape:
+                    setattr(
+                        self,
+                        name,
+                        torch.empty_like(src, device=buf.device),
+                    )
+        return super()._load_from_state_dict(
+            state_dict, prefix, *args, **kwargs
+        )
+
+    def set_state_norm(self, mean: torch.Tensor, std: torch.Tensor) -> None:
+        """Persist the training z-score stats of the AUGMENTED state.
+
+        Called once by the train script after computing the goal-augmented
+        state column's mean/std (over the full ``[obs, goal]`` vector). These
+        let ``get_cost_goal_mse`` normalize the raw eval-time ``state``/
+        ``goal_state`` exactly as training did. Stored as buffers so they are
+        carried by both ``torch.save(model)`` and ``state_dict`` checkpoints.
+        """
+        mean = torch.as_tensor(mean, dtype=torch.float32).flatten()
+        std = torch.as_tensor(std, dtype=torch.float32).flatten()
+        self.state_mean = mean
+        self.state_std = std
+
     def encode(self, obs_dict: dict) -> torch.Tensor:
-        """Encode observations into a SimNorm-normalized latent state.
+        """Encode observations into a latent state, normalized by ``sim_norm``.
+
+        ``sim_norm`` is SimNorm (TD-MPC2, the default) or a plain LayerNorm
+        (TD-MPC1 "regularizer-off", ``cfg.wm.use_simnorm=False``).
 
         Handles arbitrary leading dimensions — (B,), (B, T), (B, N) — by
         flattening into the batch axis per modality and restoring afterward.
@@ -245,10 +348,21 @@ class TDMPC2(nn.Module):
             Action tensor of shape (B, horizon, action_dim).
         """
         device = next(self.parameters()).device
-        encoding_keys = list(self.cfg.wm.get('encoding', {}).keys())
+        key = self.goal_obs_key or 'state'
+        has_goal = (f'goal_{key}' in info_dict) or ('goal' in info_dict)
 
-        obs_dict = {key: info_dict[key].to(device) for key in encoding_keys}
-        z = self.encode(obs_dict)
+        if has_goal:
+            # Goal-conditioned warm-start: the actor encodes the SAME augmented,
+            # z-scored current state ([state, goal]) the goal-MSE cost uses, so
+            # the CEM warm-start is consistent with the planning objective.
+            aug_current, _ = self._build_goal_conditioned_states(
+                info_dict, device
+            )
+            z = self.encode({key: aug_current})
+        else:
+            encoding_keys = list(self.cfg.wm.get('encoding', {}).keys())
+            obs_dict = {k: info_dict[k].to(device) for k in encoding_keys}
+            z = self.encode(obs_dict)
 
         if prefix_actions is not None:
             for t in range(prefix_actions.shape[1]):
@@ -259,14 +373,285 @@ class TDMPC2(nn.Module):
         num_trajs = self.cfg.get('num_pi_trajs', 1)
         return self.rollout(z, horizon, num_trajs)  # (B, horizon, action_dim)
 
+    # ------------------------------------------------------------------ #
+    #  Goal-conditioned latent-MSE planning cost (used for PLAN + PROBE)  #
+    # ------------------------------------------------------------------ #
+
+    def _norm_aug_state(self, x: torch.Tensor) -> torch.Tensor:
+        """Z-score an augmented-state tensor with the stored training stats.
+
+        No-op (identity) if ``set_state_norm`` was never called (empty buffers).
+        Broadcasts over arbitrary leading dims; normalizes the last dim.
+        """
+        if self.state_mean.numel() == 0:
+            return x
+        mean = self.state_mean.to(device=x.device, dtype=x.dtype)
+        std = self.state_std.to(device=x.device, dtype=x.dtype)
+        return (x - mean) / std
+
+    def _build_goal_conditioned_states(
+        self, info_dict: dict, device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Construct (augmented current, augmented goal-reached) raw states.
+
+        The model is goal-conditioned by concatenating the goal into the
+        ``goal_obs_key`` encoding modality (TwoRoom: ``state``). At eval/probe
+        time the info_dict carries the RAW current state under ``state`` and the
+        RAW goal under ``goal_state`` (env ``_get_info``) — both with whatever
+        leading dims the caller passes, e.g. ``(B, N, D)`` from the CEM solver.
+
+          current      = [state,      goal_state]   (the obs the planner sees)
+          goal-reached = [goal_state, goal_state]   (constructed goal target)
+
+        Both are z-scored with the training stats. Returns two tensors with the
+        same leading dims as the inputs and last dim ``2 * D``.
+        """
+        key = self.goal_obs_key or 'state'
+        assert key in info_dict, (
+            f"goal-MSE cost needs '{key}' in info_dict; got {list(info_dict)}"
+        )
+        # Resolve the goal key. Priority:
+        #   1) cfg.goal_col (Cube): the GOAL state lives in its own per-step
+        #      column (e.g. 'target' = the 28-d goal obs). The eval framework
+        #      broadcasts that column into the info_dict under its own name, so
+        #      the planner sees the start-state goal directly (no goal_<key>).
+        #   2) 'goal_<key>' (TwoRoom): the episode-final obs of the encoding
+        #      column, exposed by World._extract_init_goal as e.g. 'goal_state'.
+        #   3) bare 'goal' (JEPA-style image goal fallback).
+        goal_col_cfg = self.cfg.get('goal_col')
+        if goal_col_cfg is not None and goal_col_cfg in info_dict:
+            goal_key = goal_col_cfg
+        else:
+            goal_key = f'goal_{key}'
+            if goal_key not in info_dict:
+                goal_key = 'goal' if 'goal' in info_dict else None
+        assert goal_key is not None, (
+            f"goal-MSE cost needs '{goal_col_cfg or f'goal_{key}'}' (or 'goal') "
+            f'in info_dict; got {list(info_dict)}'
+        )
+
+        cur = info_dict[key].to(device).float()
+        goal = info_dict[goal_key].to(device).float()
+
+        aug_current = torch.cat([cur, goal], dim=-1)
+        aug_goal = torch.cat([goal, goal], dim=-1)
+        return self._norm_aug_state(aug_current), self._norm_aug_state(
+            aug_goal
+        )
+
+    def get_cost_goal_mse(
+        self, info_dict: dict, action_candidates: torch.Tensor
+    ) -> torch.Tensor:
+        """Differentiable goal-conditioned latent-MSE planning cost.
+
+        Mirrors the JEPA template (pldm.get_cost): encode the goal-reached
+        augmented state, roll the latent dynamics forward under each candidate
+        action trajectory, and return the squared latent distance of the final
+        rolled latent to the (detached) goal latent.
+
+          z_init = encode([state, goal])          # augmented current
+          z_goal = encode([goal,  goal]).detach()  # augmented goal-reached
+          z_t+1  = dynamics(cat[z_t, a_t])
+          cost   = sum_d (z_H - z_goal)^2          -> (B, N), lower = better
+
+        Differentiable wrt ``action_candidates``. The reward/value/actor heads
+        are NOT used here — this is the pure planning objective the v3 probe
+        differentiates. Shape: action_candidates (B, N, H, A) -> cost (B, N).
+        """
+        device = action_candidates.device
+        B, N, H, A = action_candidates.shape
+
+        aug_current, aug_goal = self._build_goal_conditioned_states(
+            info_dict, device
+        )
+        # encode handles arbitrary leading dims; pass through the state encoder.
+        z = self.encode({(self.goal_obs_key or 'state'): aug_current})
+        z_goal = self.encode({(self.goal_obs_key or 'state'): aug_goal})
+
+        # Collapse leading dims to (B*N, latent_dim).
+        z = self._flatten_latent(z, B, N)
+        z_goal = self._flatten_latent(z_goal, B, N).detach()
+
+        # Unpack the frameskip (action_block) packing: the shared CEM planner
+        # uses a per-horizon-step action of dim A = base_action_dim * block (10
+        # for TwoRoom: base 2 x block 5), matching the JEPA models. TD-MPC2's
+        # dynamics is single-step (trained at base action_dim), so we roll it
+        # base over H*block sub-steps -> the SAME env-step horizon as JEPA.
+        sub_steps = self._unpack_actions(action_candidates).reshape(
+            B * N, -1, self.cfg.action_dim
+        )  # (B*N, H*block, base_action_dim)
+        for t in range(sub_steps.shape[1]):
+            z = self.dynamics(torch.cat([z, sub_steps[:, t]], dim=-1))
+
+        cost = (z - z_goal).pow(2).sum(dim=-1)  # (B*N,)
+        return cost.view(B, N)
+
+    # ------------------------------------------------------------------ #
+    #  VISION-ONLY goal-IMAGE-MSE planning cost (cross-paradigm matched)  #
+    # ------------------------------------------------------------------ #
+
+    def _encode_pixels(self, pixels: torch.Tensor) -> torch.Tensor:
+        """Encode a pixel tensor through the CNN path, resizing to image_size.
+
+        Mirrors ``encode``'s pixel branch but is robust to the spatial size of
+        the incoming images: the eval/probe pipeline ImageNet-normalizes and
+        resizes pixels to ``cfg.eval.img_size`` (which may be the JEPA-default
+        224, not TD-MPC2's native 64). The CNN/pixel_encoder were built for
+        ``cfg.image_size`` (64), so we bilinearly resize any mismatched input to
+        that size before the CNN — keeping the model self-contained regardless
+        of the eval transform's image size. No-op when already at image_size.
+
+        Handles arbitrary leading dims; returns ``(*lead, pixel_dim)``.
+        """
+        target_dtype = next(self.parameters()).dtype
+        obs = pixels.to(target_dtype)
+        if obs.shape[-1] == 3:  # channels-last -> channels-first
+            obs = obs.movedim(-1, -3)
+        lead_dims = obs.shape[:-3]
+        obs_flat = obs.reshape(-1, *obs.shape[-3:])  # (prod(lead), C, H, W)
+        img_size = int(self.cfg.get('image_size', obs_flat.shape[-1]))
+        if obs_flat.shape[-1] != img_size or obs_flat.shape[-2] != img_size:
+            obs_flat = F.interpolate(
+                obs_flat,
+                size=(img_size, img_size),
+                mode='bilinear',
+                align_corners=False,
+            )
+        cnn_out = self.cnn(obs_flat)
+        z_pixels = self.pixel_encoder(cnn_out)
+        z_pixels = self.sim_norm(z_pixels)
+        return z_pixels.view(*lead_dims, -1)
+
+    def get_cost_goal_image_mse(
+        self, info_dict: dict, action_candidates: torch.Tensor
+    ) -> torch.Tensor:
+        """Differentiable PLAIN pixel goal-image-MSE planning cost (vision-only).
+
+        The cross-paradigm-matched objective: identical in spirit to the JEPA
+        template (``pldm.get_cost``) — encode the goal IMAGE into the goal
+        latent, roll the latent dynamics forward under each candidate action
+        trajectory, and return the squared latent distance of the final rolled
+        latent to the (detached) goal latent. NO augmented state, NO privileged
+        info — purely pixels in, latent-MSE out.
+
+          z_init = encode_pixels(info['pixels'])        # current image latent
+          z_goal = encode_pixels(info['goal']).detach()  # goal  image latent
+          z_t+1  = dynamics(cat[z_t, a_t])
+          cost   = sum_d (z_H - z_goal)^2               -> (B, N), lower=better
+
+        Differentiable wrt ``action_candidates``. The reward/value/actor heads
+        are NOT used — this is the pure planning objective the v3 probe
+        differentiates. Shape: action_candidates (B, N, H, A) -> cost (B, N).
+        """
+        assert self.use_pixels, (
+            'goal_image_mse cost requires a pixel-encoded model.'
+        )
+        assert 'pixels' in info_dict and 'goal' in info_dict, (
+            "goal_image_mse cost needs 'pixels' and 'goal' images in info_dict; "
+            f'got {list(info_dict)}'
+        )
+        device = action_candidates.device
+        B, N, H, A = action_candidates.shape
+
+        z = self._encode_pixels(info_dict['pixels'].to(device))
+        z_goal = self._encode_pixels(info_dict['goal'].to(device))
+
+        z = self._flatten_latent(z, B, N)
+        z_goal = self._flatten_latent(z_goal, B, N).detach()
+
+        # Unpack the frameskip (action_block) packing so the env-step horizon
+        # matches the JEPA models (see get_cost_goal_mse for the rationale).
+        sub_steps = self._unpack_actions(action_candidates).reshape(
+            B * N, -1, self.cfg.action_dim
+        )  # (B*N, H*block, base_action_dim)
+        for t in range(sub_steps.shape[1]):
+            z = self.dynamics(torch.cat([z, sub_steps[:, t]], dim=-1))
+
+        cost = (z - z_goal).pow(2).sum(dim=-1)  # (B*N,)
+        return cost.view(B, N)
+
+    def _unpack_actions(self, action_candidates: torch.Tensor) -> torch.Tensor:
+        """Unpack a frameskip-packed action trajectory into single sub-steps.
+
+        ``action_candidates`` is ``(..., H, A)`` with ``A = base * block``. Returns
+        ``(..., H * block, base)`` — each horizon step expanded into its ``block``
+        consecutive base-dim sub-actions, in time order. When ``A == base``
+        (block 1) this is a no-op reshape.
+        """
+        base = self.cfg.action_dim
+        *lead, H, A = action_candidates.shape
+        assert A % base == 0, (
+            f'packed action dim {A} is not a multiple of base action_dim {base}'
+        )
+        block = A // base
+        return action_candidates.reshape(*lead, H * block, base)
+
+    @staticmethod
+    def _flatten_latent(z: torch.Tensor, B: int, N: int) -> torch.Tensor:
+        """Reshape an encoded latent to ``(B*N, latent_dim)``.
+
+        The state passed to ``encode`` may carry assorted leading dims from the
+        CEM solver / probe: ``(B, N, D)``, ``(B, D)`` (no sample axis yet), or
+        ``(B, N, history, D)`` (the probe keeps a length-1 history axis). The
+        last dim is always the latent; collapse everything before it.
+
+        * leading product == B*N  -> reshape to (B*N, latent).
+        * leading product == B    -> broadcast over N, then (B*N, latent).
+        """
+        lat = z.shape[-1]
+        lead = z.numel() // lat
+        if lead == B * N:
+            return z.reshape(B * N, lat)
+        if lead == B:
+            return (
+                z.reshape(B, lat)
+                .unsqueeze(1)
+                .expand(B, N, lat)
+                .reshape(B * N, lat)
+            )
+        raise ValueError(
+            f'Unexpected latent state shape: {tuple(z.shape)} (B={B}, N={N})'
+        )
+
+    def criterion(
+        self, info_dict: dict, action_candidates: torch.Tensor
+    ) -> torch.Tensor:
+        """Costable-protocol alias for the active goal-MSE planning cost.
+
+        Routes to the pixel goal-image-MSE cost for the vision-only model and
+        to the augmented-state goal-MSE cost otherwise, matching ``get_cost``'s
+        dispatch so the v3 probe's cost-sensitivity capture wraps the right one.
+        """
+        plan_cost = self.cfg.get('plan_cost', None)
+        use_image = (plan_cost == 'goal_image_mse') or (
+            plan_cost is None and self.use_pixels and 'goal' in info_dict
+        )
+        if use_image:
+            return self.get_cost_goal_image_mse(info_dict, action_candidates)
+        return self.get_cost_goal_mse(info_dict, action_candidates)
+
     def get_cost(
         self, info_dict: dict, action_candidates: torch.Tensor
     ) -> torch.Tensor:
         """Evaluate the cost of candidate action trajectories.
 
-        Rolls out the world model for each candidate, accumulates discounted
-        rewards, and adds a terminal value estimate with an optional uncertainty
-        penalty to favour conservative planning.
+        Dispatches between three cost paths (all kept working):
+
+          * ``goal_image_mse`` (the VISION-only, cross-paradigm-matched path):
+            the differentiable PLAIN pixel goal-image-MSE cost
+            (:meth:`get_cost_goal_image_mse`). Selected when ``cfg.plan_cost ==
+            'goal_image_mse'`` OR (``cfg.plan_cost`` unset AND the model is
+            pixel-encoded AND a ``'goal'`` image is present). This is what the
+            vision TD-MPC2 plans/probes with — matched to the JEPA models.
+          * ``goal_mse`` (the AUGMENTED-state path, state models only): the
+            differentiable goal-conditioned latent-MSE cost in the augmented
+            ``[state, goal]`` latent (:meth:`get_cost_goal_mse`). Selected when
+            ``cfg.plan_cost == 'goal_mse'`` OR (``cfg.plan_cost`` unset, NOT
+            pixel-encoded, AND a goal key is present).
+          * ``reward_value`` (the native TD-MPC2 cost): rolls out the world
+            model, accumulates discounted predicted rewards, and adds a terminal
+            conservative-Q value. Selected when ``cfg.plan_cost ==
+            'reward_value'`` or no goal is available.
 
         Args:
             info_dict: Dictionary containing environment state with shape (B, N, ...).
@@ -275,6 +660,25 @@ class TDMPC2(nn.Module):
         Returns:
             Cost tensor of shape (B, N). Lower is better.
         """
+        plan_cost = self.cfg.get('plan_cost', None)
+        key = self.goal_obs_key or 'state'
+        has_image_goal = 'goal' in info_dict
+        has_state_goal = (f'goal_{key}' in info_dict) or ('goal' in info_dict)
+
+        # Vision-only goal-image-MSE: explicit, or auto for a pixel-encoded model
+        # presented with a goal image.
+        use_image_mse = (plan_cost == 'goal_image_mse') or (
+            plan_cost is None and self.use_pixels and has_image_goal
+        )
+        if use_image_mse:
+            return self.get_cost_goal_image_mse(info_dict, action_candidates)
+
+        use_goal_mse = (plan_cost == 'goal_mse') or (
+            plan_cost is None and not self.use_pixels and has_state_goal
+        )
+        if use_goal_mse:
+            return self.get_cost_goal_mse(info_dict, action_candidates)
+
         device = action_candidates.device
         encoding_keys = list(self.cfg.wm.get('encoding', {}).keys())
 
@@ -292,7 +696,11 @@ class TDMPC2(nn.Module):
         else:
             raise ValueError(f'Unexpected latent state shape: {z.shape}')
 
-        actions = action_candidates.view(B * N, H, A)
+        # Unpack frameskip packing to single-step (base) actions, as the
+        # dynamics/reward heads expect; no-op when A == base action_dim.
+        actions = self._unpack_actions(action_candidates).reshape(
+            B * N, -1, self.cfg.action_dim
+        )
 
         G, discount = 0, 1.0
         c = self.cfg.wm.get('uncertainty_penalty', 0.5)
@@ -300,7 +708,7 @@ class TDMPC2(nn.Module):
             B * N, 1, dtype=torch.float32, device=z.device
         )
 
-        for t in range(H):
+        for t in range(actions.shape[1]):
             z_a = torch.cat([z, actions[:, t]], dim=-1)
             reward = two_hot_inv(self.reward(z_a), self.cfg)
             z = self.dynamics(z_a)
@@ -360,7 +768,10 @@ def tdmpc2_forward(self, batch, stage, cfg):
 
     for t in range(cfg.wm.horizon):
         action = batch['action'][:, t]
-        reward = batch['reward'][:, t]
+        # Dataset reward is (B, 1); collapse to (B,) so two_hot / the
+        # target_q = reward.unsqueeze(1) + ... arithmetic stay 2-D (a trailing
+        # singleton would make target_q 3-D and break two_hot's scatter_).
+        reward = batch['reward'][:, t].reshape(B)
 
         next_z_pred, reward_pred = self.model.forward(z, action)
 
