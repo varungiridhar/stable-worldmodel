@@ -60,6 +60,13 @@ eval:
   #     cycled across the num_eval envs from task_ids below.
   goal_mode: offset
   task_ids: [0, 1, 2, 3, 4]
+  # CUBE-MOVING START FILTER (null = legacy; sample any valid start). When set,
+  # eval / GCS keep only starts whose cube (start_move_col) moves >= this many
+  # metres over goal_offset_steps WITHIN the episode, so the offset goal demands
+  # real manipulation instead of a stationary cube. Applied identically in
+  # eval_wm.py and gcs_align.py (same valid set + seed => same start states).
+  start_move_thresh: null
+  start_move_col: privileged/block_0_pos
   callables:
     # -- set the start state (full mujoco qpos/qvel at the start step)
     - method: set_state

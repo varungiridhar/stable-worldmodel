@@ -410,6 +410,11 @@ class World:
         ep_count = 0
 
         for t in range(max_steps if max_steps is not None else 2**63):
+            # Announce the step BEFORE planning so a slow per-model plan (e.g. the
+            # heavy per-patch CEM) is visible immediately, not only once the step
+            # completes -- otherwise a long first plan looks like a hung/black-box.
+            if max_steps is not None:
+                print(f'[eval] step {t + 1}/{max_steps} planning...', flush=True)
             actions = self._get_actions()
 
             mask = alive if not alive.all() else None
@@ -419,6 +424,23 @@ class World:
 
             if on_step:
                 on_step(self)
+
+            # Flushed per-step progress (eval-budget mode) so long MPC evals are
+            # never a black box: prints step count + alive envs + terminations so
+            # far, giving a live progress bar and an ETA to catch a run that won't
+            # finish before its walltime. Cheap: one print per env step.
+            if max_steps is not None:
+                _alv = int(alive.sum())
+                _trm = (
+                    int(self.terminateds.sum())
+                    if self.terminateds is not None
+                    else 0
+                )
+                print(
+                    f'[eval] step {t + 1}/{max_steps}  alive={_alv}  '
+                    f'term_this_step={_trm}',
+                    flush=True,
+                )
 
             done = alive & (self.terminateds | self.truncateds)
             if not done.any():

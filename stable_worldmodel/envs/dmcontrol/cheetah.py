@@ -12,6 +12,9 @@ from stable_worldmodel.envs.dmcontrol.custom_tasks.cheetah import (
     CustomCheetah,
     Physics,
 )
+from stable_worldmodel.envs.dmcontrol.custom_tasks.qpos_match import (
+    make_qpos_match_task,
+)
 from stable_worldmodel.envs.dmcontrol.dmcontrol import DMControlWrapper
 
 
@@ -29,6 +32,7 @@ _TASKS = (
     'legs-up',
     'flip',
     'flip-backward',
+    'qpos_match',
 )
 
 _TASK_MOVE_SPEEDS = {
@@ -43,6 +47,7 @@ _TASK_MOVE_SPEEDS = {
     'legs-up': 0,
     'flip': 0,
     'flip-backward': 0,
+    'qpos_match': 0,
 }
 
 
@@ -205,9 +210,27 @@ class CheetahDMControlWrapper(DMControlWrapper):
         )
         xml_path = os.path.join(self._mjcf_tempdir.name, 'cheetah.xml')
         physics = Physics.from_xml_path(xml_path)
-        task = CustomCheetah(
-            goal=self._task, move_speed=self._move_speed, random=seed
-        )
+        if self._task == 'qpos_match':
+            # CustomCheetah.get_reward raises for an unknown goal, so wrap a
+            # valid goal ('run'); its reward is ignored — qpos_match success
+            # comes from the externally-set target qpos via the mixin.
+            task = make_qpos_match_task(CustomCheetah)(
+                goal='run',
+                move_speed=self._move_speed,
+                random=seed,
+                qpos_threshold=0.05,
+                # Match over the 6 BOUNDED leg hinges only (qpos[3:9]); the free
+                # root (rootx slide / rootz / rooty pitch = qpos[0:3]) is
+                # uncontrollable to a target, so including it would make success
+                # ~0 with no spread. MUST match the gcs_align _TASKS mask.
+                qpos_mask=[
+                    False, False, False, True, True, True, True, True, True,
+                ],
+            )
+        else:
+            task = CustomCheetah(
+                goal=self._task, move_speed=self._move_speed, random=seed
+            )
         environment_kwargs = environment_kwargs or {}
         env = control.Environment(
             physics, task, time_limit=_DEFAULT_TIME_LIMIT, **environment_kwargs
@@ -216,6 +239,11 @@ class CheetahDMControlWrapper(DMControlWrapper):
         self.env = env
         # Mark the environment as clean.
         self._dirty = False
+
+    def _is_terminated(self, step) -> bool:
+        if self._task != 'qpos_match':
+            return False
+        return self._qpos_match_terminated(step)
 
     def modify_mjcf_model(self, mjcf_model):
         """Apply visual variations to the MuJoCo model based on variation space.

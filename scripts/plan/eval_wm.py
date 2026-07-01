@@ -207,6 +207,27 @@ def run(cfg: DictConfig):
     valid_indices = np.nonzero(valid_mask)[0]
     print(valid_mask.sum(), 'valid starting points found for evaluation.')
 
+    # OPTIONAL cube-moving start filter (default null = legacy behavior): keep
+    # only starts whose tracked object moves >= start_move_thresh over the goal
+    # offset, so the goal demands real manipulation (not a stationary cube). Must
+    # match gcs_align.py byte-for-byte (same valid set, seed => same starts).
+    move_thresh = cfg.eval.get('start_move_thresh', None)
+    if move_thresh is not None:
+        pos_col = cfg.eval.get('start_move_col', 'privileged/block_0_pos')
+        valid_indices = swm.data.utils.filter_moving_starts(
+            dataset,
+            valid_indices,
+            cfg.eval.goal_offset_steps,
+            float(move_thresh),
+            pos_col,
+            col_name,
+        )
+        print(
+            len(valid_indices),
+            f'start points after move filter (thresh={move_thresh} on '
+            f'{pos_col}).',
+        )
+
     g = np.random.default_rng(cfg.seed)
     random_episode_indices = g.choice(
         len(valid_indices) - 1, size=cfg.eval.num_eval, replace=False

@@ -8,6 +8,9 @@ from dm_control.suite import pendulum
 from dm_control.suite.wrappers import action_scale
 
 from stable_worldmodel import spaces as swm_space
+from stable_worldmodel.envs.dmcontrol.custom_tasks.qpos_match import (
+    make_qpos_match_task,
+)
 from stable_worldmodel.envs.dmcontrol.dmcontrol import DMControlWrapper
 
 
@@ -15,7 +18,18 @@ _DEFAULT_TIME_LIMIT = 20
 
 
 class PendulumDMControlWrapper(DMControlWrapper):
-    def __init__(self, seed=None, environment_kwargs=None, render_mode=None):
+    def __init__(
+        self,
+        task='swingup',
+        seed=None,
+        environment_kwargs=None,
+        render_mode=None,
+    ):
+        if task not in ('swingup', 'qpos_match'):
+            raise ValueError(
+                f"Unknown task '{task}'. Must be 'swingup' or 'qpos_match'."
+            )
+        self._task_name = task
         xml, assets = pendulum.get_model_and_assets()
         xml = xml.replace(b'file="./common/', b'file="common/')
         suite_dir = os.path.dirname(pendulum.__file__)  # .../dm_control/suite
@@ -142,7 +156,12 @@ class PendulumDMControlWrapper(DMControlWrapper):
         )
         xml_path = os.path.join(self._mjcf_tempdir.name, 'pendulum.xml')
         physics = pendulum.Physics.from_xml_path(xml_path)
-        task = pendulum.SwingUp(random=seed)
+        if self._task_name == 'qpos_match':
+            task = make_qpos_match_task(pendulum.SwingUp)(
+                random=seed, qpos_threshold=0.05
+            )
+        else:
+            task = pendulum.SwingUp(random=seed)
         environment_kwargs = environment_kwargs or {}
         env = control.Environment(
             physics, task, time_limit=_DEFAULT_TIME_LIMIT, **environment_kwargs
@@ -151,6 +170,11 @@ class PendulumDMControlWrapper(DMControlWrapper):
         self.env = env
         # Mark the environment as clean.
         self._dirty = False
+
+    def _is_terminated(self, step) -> bool:
+        if self._task_name != 'qpos_match':
+            return False
+        return self._qpos_match_terminated(step)
 
     def modify_mjcf_model(self, mjcf_model):
         """Apply visual variations to the MuJoCo model based on variation space.

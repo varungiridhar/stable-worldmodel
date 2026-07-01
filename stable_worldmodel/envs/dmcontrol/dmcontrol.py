@@ -156,6 +156,31 @@ class DMControlWrapper(gym.Env):
             self.env.physics.data.act[:] = None
         self.env.physics.forward()
 
+    def set_target_qpos(self, target_qpos):
+        """Inject the goal qpos for a ``qpos_match`` task.
+
+        Domain-independent: the eval / GCS callables call this to set the goal
+        (the true qpos ``goal_offset_steps`` ahead in the dataset). Per-domain
+        wrappers that opt into ``qpos_match`` get this for free; the validated
+        Reacher wrapper keeps its own stricter override.
+        """
+        self.env.task.target_qpos = np.asarray(target_qpos, dtype=np.float64)
+
+    def _qpos_match_terminated(self, step) -> bool:
+        """Generic success check for ``qpos_match`` tasks.
+
+        Mirrors ``ReacherDMControlWrapper._is_terminated``: the episode ended
+        (``step.last()``) *and* it ended because the current qpos matched the
+        externally-set target within threshold (``get_termination`` fired), not
+        because the time limit was hit.
+        """
+        task = self.env.task
+        return bool(
+            step.last()
+            and getattr(task, 'target_qpos', None) is not None
+            and task.get_termination(self.env.physics) is not None
+        )
+
     def render(self, width=224, height=224, camera_id=None):
         return self.env.physics.render(
             height, width, camera_id or self.camera_id

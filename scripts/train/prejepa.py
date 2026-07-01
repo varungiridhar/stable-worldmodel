@@ -72,6 +72,7 @@ class SaveCkptCallback(Callback):
         epoch_interval=1,
         intra_epoch_steps=None,
         intra_epoch_max_epoch=0,
+        step_interval=0,
     ):
         super().__init__()
         self.run_name = run_name
@@ -79,20 +80,36 @@ class SaveCkptCallback(Callback):
         self.epoch_interval = epoch_interval
         self.intra_epoch_steps = sorted(intra_epoch_steps or [])
         self.intra_epoch_max_epoch = intra_epoch_max_epoch
+        self.step_interval = step_interval
         self._saved_targets = set()
+        # Next global step at which the uniform-cadence save fires. Realigned
+        # above the resumed step on requeue (see on_train_batch_end).
+        self._next_step_target = step_interval if step_interval else None
 
     def on_train_batch_end(
         self, trainer, pl_module, outputs, batch, batch_idx
     ):
         if not trainer.is_global_zero:
             return
-        if trainer.current_epoch >= self.intra_epoch_max_epoch:
-            return
         step = trainer.global_step
-        for target in self.intra_epoch_steps:
-            if step >= target and target not in self._saved_targets:
-                self._saved_targets.add(target)
-                self._save(pl_module.model, f'weights_step_{target}.pt')
+        # Dense early-training saves: one-shot global-step thresholds, gated to
+        # early epochs so the ESNR U-shape minimum is resolvable.
+        if trainer.current_epoch < self.intra_epoch_max_epoch:
+            for target in self.intra_epoch_steps:
+                if step >= target and target not in self._saved_targets:
+                    self._saved_targets.add(target)
+                    self._save(pl_module.model, f'weights_step_{target}.pt')
+        # Uniform cadence across ALL epochs (bounds loss to <= step_interval
+        # steps on an embers/inferno kill). Resume-safe: a requeued run gets a
+        # fresh callback, so we realign the target above the resumed step rather
+        # than re-dumping every past multiple. Files are named by the actual
+        # global step, so post-resume saves never collide with pre-resume ones.
+        if (
+            self._next_step_target is not None
+            and step >= self._next_step_target
+        ):
+            self._save(pl_module.model, f'weights_step_{step}.pt')
+            self._next_step_target = step + self.step_interval
 
     def on_train_epoch_end(self, trainer, pl_module):
         if not trainer.is_global_zero:
@@ -361,6 +378,7 @@ def run(cfg):
                 intra_epoch_max_epoch=cfg.get('ckpt', {}).get(
                     'intra_epoch_max_epoch', 0
                 ),
+                step_interval=cfg.get('ckpt', {}).get('step_interval', 0),
             ),
             pl.pytorch.callbacks.LearningRateMonitor(logging_interval='step'),
         ],

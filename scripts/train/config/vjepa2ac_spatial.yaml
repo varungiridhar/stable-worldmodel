@@ -1,0 +1,109 @@
+# V-JEPA2-AC SPATIAL (Phase-5): re-base V-JEPA2-AC onto PreJEPA, keeping PER-PATCH
+# tokens (fixes the mean-pool bug in the LeWM-path VJEPA2AC; see
+# experiments/2026-06-27-phase4b-vjepa2ac/eval_audit_findings.md ③). Mirrors
+# prejepa.yaml (per-patch encode -> predict -> per-patch MSE via dinowm_forward)
+# but swaps the trained dinov2 encoder for a FROZEN V-JEPA2 ViT-L (embed 1024,
+# crop 256, 256 patches). The encoder adapter clips internally, so the backbone
+# is driven as a per-frame image encoder (is_video_encoder=false). Action-only
+# encoding (no proprio) to match the p4z V-JEPA2-AC recipe; NO projector (PreJEPA
+# convention; predictor dim auto = 1024 + action_dim). Train via:
+#   python scripts/train/prejepa.py --config-name vjepa2ac_spatial
+defaults:
+  - _self_
+  - launcher: local
+
+hydra:
+  job:
+    chdir: true
+
+# --- Run ---
+output_model_name: pusht_vjepa2acsp
+subdir: null
+seed: 42
+column_aliases: null
+
+# --- Checkpointing ---
+# epoch_interval: save every N epochs (+ always the final epoch).
+# step_interval: uniform-cadence weights_step_<global_step>.pt every N steps
+#   (0 = off) -- bounds data loss to <= N steps on an embers/inferno kill.
+# intra_epoch_steps: extra dense early saves (ESNR U-shape), gated to early epochs.
+ckpt:
+  epoch_interval: 1
+  intra_epoch_steps: []
+  intra_epoch_max_epoch: 0
+  step_interval: 0
+
+# --- Data ---
+dataset_name: pusht_expert_train.h5
+cache_dir: null
+n_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}
+frameskip: 5
+
+batch_size: 8  # frozen ViT-L on 256^2 is heavy; keep modest
+num_workers: 8
+train_split: 0.9
+
+# --- Backbone ---
+backbone:
+  name: vjepa2_large  # -> facebook/vjepa2-vitl-fpc64-256
+  type: vjepa2_large
+  is_video_encoder: false  # the VJEPA2ACSpatial adapter clips frames internally
+  interpolate_pos_encoding: false  # V-JEPA2 does not accept interpolate_pos_encoding
+
+image_size: 256  # V-JEPA2 crop_size
+patch_size: 16   # 256 / 16 = 16 -> 256 patches
+
+# --- World model ---
+wm:
+  history_size: 3
+  num_preds: 1
+  encoding:
+    action: 10  # action-only (no proprio), matching the p4z V-JEPA2-AC recipe
+
+predictor:
+  size: large  # used in output_model_name only
+  depth: 6
+  heads: 16
+  mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.1
+  emb_dropout: 0.0
+
+model:
+  _target_: stable_worldmodel.wm.vjepa2.VJEPA2ACSpatial
+  history_size: ${wm.history_size}
+  num_pred: ${wm.num_preds}
+  interpolate_pos_encoding: ${backbone.interpolate_pos_encoding}
+  tubelet_size: 2
+  freeze_encoder: true
+  encoder:
+    _target_: stable_worldmodel.wm.prejepa.module.create_backbone
+    name: ${backbone.name}
+  predictor:
+    _target_: stable_worldmodel.wm.prejepa.module.CausalPredictor
+    num_patches: ???
+    num_frames: ${wm.history_size}
+    dim: ???
+    depth: ${predictor.depth}
+    heads: ${predictor.heads}
+    mlp_dim: ${predictor.mlp_dim}
+    dim_head: ${predictor.dim_head}
+    dropout: ${predictor.dropout}
+    emb_dropout: ${predictor.emb_dropout}
+
+# --- Optimizer ---
+optimizer:
+  type: AdamW
+  lr: 5e-4
+  weight_decay: 0.0
+
+# --- Trainer ---
+trainer:
+  max_epochs: 10
+  strategy: ddp
+  devices: auto
+  accelerator: gpu
+  precision: bf16  # frozen V-JEPA2 ViT-L: bf16 autocast (safer range than fp16)
+  gradient_clip_val: 1.0
+
+dump_object: true

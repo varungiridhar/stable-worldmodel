@@ -25,9 +25,10 @@ BACKBONE_ALIASES = {
     "mae_huge":            "facebook/vit-mae-huge",
     # I-JEPA
     "ijepa_huge":          "facebook/ijepa-huge-patch14-224",
-    # VJEPA2
-    "vjepa2_large":        "facebook/vjepa2-vit-l",
-    "vjepa2_huge":         "facebook/vjepa2-vit-h",
+    # VJEPA2  (Phase-4b V-JEPA2-AC port; repo ids verified live on the HF hub —
+    # the old vjepa2-vit-{l,h} aliases 404'd)
+    "vjepa2_large":        "facebook/vjepa2-vitl-fpc64-256",
+    "vjepa2_huge":         "facebook/vjepa2-vith-fpc64-256",
     # WebSSL
     "webssl_large":        "facebook/webssl-vith14-5b",
     # ViT

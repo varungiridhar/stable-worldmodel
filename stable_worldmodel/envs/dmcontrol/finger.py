@@ -8,6 +8,9 @@ from dm_control.suite import finger
 from dm_control.suite.wrappers import action_scale
 
 from stable_worldmodel import spaces as swm_space
+from stable_worldmodel.envs.dmcontrol.custom_tasks.qpos_match import (
+    make_qpos_match_task,
+)
 from stable_worldmodel.envs.dmcontrol.dmcontrol import DMControlWrapper
 
 
@@ -17,7 +20,7 @@ _CONTROL_TIMESTEP = 0.02
 _EASY_TARGET_SIZE = 0.07
 _HARD_TARGET_SIZE = 0.03
 
-_TASKS = {'spin', 'turn_easy', 'turn_hard'}
+_TASKS = {'spin', 'turn_easy', 'turn_hard', 'qpos_match'}
 
 
 class FingerDMControlWrapper(DMControlWrapper):
@@ -169,7 +172,17 @@ class FingerDMControlWrapper(DMControlWrapper):
         )
         xml_path = os.path.join(self._mjcf_tempdir.name, 'finger.xml')
         physics = finger.Physics.from_xml_path(xml_path)
-        if self._task_name == 'spin':
+        if self._task_name == 'qpos_match':
+            task = make_qpos_match_task(finger.Turn)(
+                target_radius=_HARD_TARGET_SIZE,
+                random=seed,
+                qpos_threshold=0.05,
+                # Match over the 2 actuated finger hinges only; qpos[2] is the
+                # free-spinning hinge (uncontrollable to a target). MUST match
+                # the gcs_align _TASKS mask.
+                qpos_mask=[True, True, False],
+            )
+        elif self._task_name == 'spin':
             task = finger.Spin(random=seed)
         elif self._task_name == 'turn_easy':
             task = finger.Turn(target_radius=_EASY_TARGET_SIZE, random=seed)
@@ -187,6 +200,11 @@ class FingerDMControlWrapper(DMControlWrapper):
         self.env = env
         # Mark the environment as clean.
         self._dirty = False
+
+    def _is_terminated(self, step) -> bool:
+        if self._task_name != 'qpos_match':
+            return False
+        return self._qpos_match_terminated(step)
 
     def modify_mjcf_model(self, mjcf_model):
         """Apply visual variations to the MuJoCo model based on variation space.

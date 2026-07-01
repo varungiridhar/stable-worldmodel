@@ -29,6 +29,16 @@ and ``N`` action sequences sampled from the CEM prior ``N(0, var_scale)``:
 Mirrors ``grad_dump.py`` for model/env/dataset setup and start-state sampling, so
 the model-cost path is taken on the SAME start/goal states as the MPC eval.
 
+``+gcs.proposal`` selects where the N actions are drawn from. Default ``prior``
+is vanilla GCS above (CEM prior ``N(0, var_scale)``). ``cem_centered`` is
+*GCS-at-the-optimum*: it first runs the eval CEM planner to its converged plan,
+then draws the N actions from a same-width proposal RE-CENTERED on that optimum
+(``N(cem_mean, var_scale)``), so GCS scores the cost<->true-distance agreement in
+the neighborhood the optimizer actually moves into. This reproduces
+``probe_cost_geometry.py``'s ``gcs_optimized`` (and reuses the SAME
+``collect_planning_grads(proposal='cem_centered', solver=...)`` path), and the
+result is still written under the ``['gcs']`` key (with a ``proposal`` field).
+
     python scripts/plan/gcs_align.py --config-name tworoom \
       policy=p1a_prejepa_s0/weights_epoch_20.pt \
       eval.dataset_name=tworoom_expert.lance eval.num_eval=16 \
@@ -41,6 +51,7 @@ the model-cost path is taken on the SAME start/goal states as the MPC eval.
 import json
 import os
 import re
+from functools import partial
 from pathlib import Path
 
 os.environ.setdefault('MUJOCO_GL', 'egl')
@@ -92,6 +103,18 @@ def get_episodes_length(dataset, episodes):
 
 class _CaptureDone(BaseException):
     pass
+
+
+def _clear_wm_caches(model):
+    """Clear PreJEPA's stateful init/goal embedding caches between solves.
+
+    Byte-identical to ``swm.metrics.esnr._clear_wm_caches`` (and the C-probe's
+    ``_clear_caches``); used by the ``cem_centered`` proposal so the inner
+    ``solver.solve`` re-derives the eval planner's optimum from clean caches.
+    """
+    for attr in ('_init_cached_info', '_goal_cached_info'):
+        if hasattr(model, attr):
+            delattr(model, attr)
 
 
 def _parse_ckpt(policy: str):
@@ -159,6 +182,53 @@ def _dist_pusht(term, goal):
     return float(pos_err + _PUSHT_ANGLE_W * ang)
 
 
+# --- Phase-4a: generic DMControl reach-target (qpos_match) reader / distance.
+#     Any DMControl domain wired with the generic qpos_match task
+#     (custom_tasks/qpos_match.py) is GCS-eligible with no bespoke reader: its
+#     true terminal state is `physics.data.qpos` and the goal is `goal_qpos`
+#     (auto-derived from the dataset 'qpos' column at start+offset).
+def _read_true_qpos(env_u):
+    # Privileged joint state qpos (nq,). Identical to _read_true_reacher; shared
+    # across every qpos_match domain.
+    return np.copy(env_u.env.physics.data.qpos).astype(np.float64)
+
+
+def _dist_qpos(term, goal, mask=None, scale=None):
+    # ||qpos - goal_qpos|| over the matched DOFs (raw, no wrap -- matches
+    # QPosMatchMixin.get_termination's raw per-joint diff). `mask` (bool over nq)
+    # drops DOFs no controller can place to the goal (free root slide / free
+    # spinner) which would otherwise flatten d_true; `scale` (per-DOF) makes
+    # mixed-unit qpos commensurate (e.g. cart metres vs pole radians). Defaults
+    # reproduce the plain reacher L2.
+    term = np.asarray(term, dtype=np.float64)
+    goal = np.asarray(goal, dtype=np.float64)
+    n = min(term.shape[0], goal.shape[0])
+    d = term[:n] - goal[:n]
+    if mask is not None:
+        d = d[np.asarray(mask, dtype=bool)[:n]]
+    if scale is not None:
+        d = d / np.asarray(scale, dtype=np.float64)[: len(d)]
+    return float(np.linalg.norm(d))
+
+
+# --- OGBench-Cube: TRUE state = block-0 position (3-D). The env success reads
+#     obj_pos = _data.joint('object_joint_0').qpos[:3] and checks
+#     ||obj_pos - target|| <= 0.04 m (cube_env._compute_successes); the dataset
+#     logs exactly that as privileged/block_0_pos. We read the SAME quantity and
+#     take the goal from goal_privileged/block_0_pos (block_0_pos at start+offset)
+#     so d_true mirrors the success metric.
+def _read_true_cube(env_u):
+    return np.asarray(
+        env_u._data.joint('object_joint_0').qpos[:3], dtype=np.float64
+    ).reshape(-1)[:3]
+
+
+def _dist_cube(term, goal):
+    term = np.asarray(term, dtype=np.float64)
+    goal = np.asarray(goal, dtype=np.float64)
+    return float(np.linalg.norm(term[:3] - goal[:3]))
+
+
 # env_name -> (read_terminal_true(env_u), goal_state_key, dist(term, goal_true))
 _TASKS = {
     'swm/TwoRoom-v1': (_read_true_tworoom, 'goal_state', _dist_tworoom),
@@ -168,6 +238,30 @@ _TASKS = {
         _dist_reacher,
     ),
     'swm/PushT-v1': (_read_true_pusht, 'goal_state', _dist_pusht),
+    # --- Phase-4a DMControl reach-target tasks (generic qpos-match) ---
+    # NB: each mask MUST equal the env wrapper's qpos_mask (so env success and
+    # the metric's d_true score the SAME DOFs); free/unbounded DOFs are dropped.
+    'swm/CartpoleDMControl-v0': (_read_true_qpos, 'goal_qpos', _dist_qpos),
+    'swm/FingerDMControl-v0': (
+        _read_true_qpos,
+        'goal_qpos',
+        partial(_dist_qpos, mask=[True, True, False]),  # drop free spinner
+    ),
+    'swm/CheetahDMControl-v0': (
+        _read_true_qpos,
+        'goal_qpos',
+        partial(  # 6 bounded leg hinges only; drop free root qpos[0:3]
+            _dist_qpos,
+            mask=[False, False, False, True, True, True, True, True, True],
+        ),
+    ),
+    'swm/PendulumDMControl-v0': (_read_true_qpos, 'goal_qpos', _dist_qpos),
+    # --- OGBench-Cube manipulation (block-0 position; success = L2 <= 0.04 m) ---
+    'swm/OGBCube-v0': (
+        _read_true_cube,
+        'goal_privileged/block_0_pos',
+        _dist_cube,
+    ),
 }
 
 
@@ -197,6 +291,21 @@ def run(cfg: DictConfig):
     var_scale = float(OmegaConf.select(cfg, 'gcs.var_scale', default=1.0))
     sample_batch = int(OmegaConf.select(cfg, 'gcs.sample_batch', default=16))
     obs_batch = int(OmegaConf.select(cfg, 'gcs.obs_batch', default=1))
+    # 'prior' (default) == vanilla GCS: draw the N actions from the CEM prior
+    # N(0, var_scale). 'cem_centered' == GCS-at-the-optimum: re-center the
+    # same-width proposal on the converged CEM optimum N(cem_mean, var_scale),
+    # mirroring probe_cost_geometry.py's GCS_optimized (the C-probe).
+    proposal = str(OmegaConf.select(cfg, 'gcs.proposal', default='prior'))
+    assert proposal in ('prior', 'cem_centered'), (
+        f"gcs.proposal must be 'prior' or 'cem_centered', got {proposal!r}"
+    )
+    # Stage-2 (ADDITIVE): when true, ALSO record the task's TRUE state at EVERY
+    # rollout step (via the same read_true used for d_true) and the goal vector,
+    # caching them to the sidecar npz so distances can be redefined OFFLINE to
+    # mirror the eval success criterion -- without re-running the sim. This does
+    # NOT touch c_model, d_true, or the gcs value (the d_true line is untouched);
+    # it only appends two arrays to the npz. Default False -> legacy behavior.
+    cache_traj = bool(OmegaConf.select(cfg, 'gcs.cache_traj', default=False))
 
     # --- world + transforms + dataset (mirror grad_dump.py exactly) ---
     cfg.world.max_episode_steps = 2 * cfg.eval.eval_budget
@@ -256,6 +365,26 @@ def run(cfg: DictConfig):
     msd = {e: max_start[i] for i, e in enumerate(ep_indices)}
     per_row = np.array([msd[e] for e in dataset.get_col_data(col_name)])
     valid = np.nonzero(dataset.get_col_data('step_idx') <= per_row)[0]
+    # OPTIONAL cube-moving start filter (default null = legacy behavior); MUST
+    # mirror eval_wm.py exactly so GCS scores the same start states as the MPC
+    # eval (same valid set, seed, threshold => identical sampled starts).
+    move_thresh = OmegaConf.select(cfg, 'eval.start_move_thresh', default=None)
+    if move_thresh is not None:
+        pos_col = OmegaConf.select(
+            cfg, 'eval.start_move_col', default='privileged/block_0_pos'
+        )
+        valid = swm.data.utils.filter_moving_starts(
+            dataset,
+            valid,
+            cfg.eval.goal_offset_steps,
+            float(move_thresh),
+            pos_col,
+            col_name,
+        )
+        print(
+            f'[gcs] {len(valid)} start points after move filter '
+            f'(thresh={move_thresh} on {pos_col}).'
+        )
     g = np.random.default_rng(cfg.seed)
     idx = np.sort(
         valid[g.choice(len(valid) - 1, size=cfg.eval.num_eval, replace=False)]
@@ -277,6 +406,7 @@ def run(cfg: DictConfig):
         }
         raise _CaptureDone()
 
+    orig_solve = policy.solver.solve
     policy.solver.solve = _cap
     try:
         world.evaluate(
@@ -292,6 +422,10 @@ def run(cfg: DictConfig):
         )
     except _CaptureDone:
         pass
+    finally:
+        # Restore the REAL solve: the cem_centered proposal calls solver.solve
+        # inside collect_planning_grads to find the CEM optimum to re-center on.
+        policy.solver.solve = orig_solve
     assert 'info' in captured, 'Solver never called; could not capture info.'
     info = captured['info']
 
@@ -315,6 +449,14 @@ def run(cfg: DictConfig):
     )
 
     # --- (1) model-cost path: c_model[n,b] + the EXACT sampled actions -------- #
+    # For 'cem_centered' (GCS-at-the-optimum), re-seed the CEM generator and
+    # clear the WM caches so the solver.solve run INSIDE collect_planning_grads
+    # (which finds the optimum to re-center the proposal on) reproduces the eval
+    # planner's optimum -- byte-identical to probe_cost_geometry.py's
+    # GCS_optimized preamble. The N-sample draw then uses its own seeded gen.
+    if proposal == 'cem_centered':
+        solver.torch_gen.manual_seed(int(cfg.seed))
+        _clear_wm_caches(model)
     _grads, costs, aux = swm.metrics.collect_planning_grads(
         model,
         info,
@@ -326,8 +468,8 @@ def run(cfg: DictConfig):
         device='cuda',
         obs_batch=obs_batch,
         sample_batch=sample_batch,
-        proposal='prior',
-        solver=None,
+        proposal=proposal,
+        solver=solver if proposal == 'cem_centered' else None,
         capture_cost_sens=False,
         return_actions=True,
     )
@@ -354,10 +496,20 @@ def run(cfg: DictConfig):
     merged = {**init_state, **goal_state}
 
     d_true = np.full((N, B), np.nan, dtype=np.float64)
+    # Stage-2 traj cache (additive; only populated when cache_traj). traj_states
+    # is lazily allocated once the per-step true-state dim is known (read_true);
+    # goal_vecs holds each start's goal vector (same layout read_true returns).
+    traj_states = None  # -> (N, B, n_env_steps, state_dim)
+    goal_vecs = None    # -> (B, goal_dim)
     for b in range(B):
         env_u = world.envs.envs[b].unwrapped
         merged_b = {k: v[b] for k, v in merged.items()}
         goal_b = goal_true[b]
+        if cache_traj:
+            gv = np.asarray(goal_b, dtype=np.float64).reshape(-1)
+            if goal_vecs is None:
+                goal_vecs = np.full((B, gv.shape[0]), np.nan, dtype=np.float64)
+            goal_vecs[b, : gv.shape[0]] = gv
         # actions for this start: (N, H, A) normalised -> per-sample env rollout
         for n in range(N):
             # restore to the SAME physical start as the model-cost path: a fresh
@@ -373,6 +525,20 @@ def run(cfg: DictConfig):
                 env_u.step(
                     np.asarray(seq_raw[t])
                 )  # ignore terminated: full roll
+                if cache_traj:
+                    # record the SAME true-state read_true uses for d_true, at
+                    # every step (anytime/min-over-t distances become free).
+                    s_t = np.asarray(
+                        read_true(env_u), dtype=np.float64
+                    ).reshape(-1)
+                    if traj_states is None:
+                        traj_states = np.full(
+                            (N, B, n_env_steps, s_t.shape[0]),
+                            np.nan,
+                            dtype=np.float64,
+                        )
+                    traj_states[n, b, t, : s_t.shape[0]] = s_t
+            # UNCHANGED: terminal d_true via the task's faithful dist_fn.
             d_true[n, b] = dist_fn(read_true(env_u), goal_b)
 
     # --- (3) GCS = nanmean_b spearman_n(c_model[:,b], d_true[:,b]) ------------- #
@@ -385,13 +551,15 @@ def run(cfg: DictConfig):
 
     model_dir, ckpt_kind, ckpt_num = _parse_ckpt(cfg.policy)
     print(
-        f'[gcs] GCS={gcs:+.4f}  (nanmean over {n_valid_b}/{B} starts; '
-        f'higher=better)  run={model_dir} ckpt={Path(cfg.policy).name}'
+        f'[gcs] GCS={gcs:+.4f}  (proposal={proposal}; nanmean over '
+        f'{n_valid_b}/{B} starts; higher=better)  run={model_dir} '
+        f'ckpt={Path(cfg.policy).name}'
     )
     print(f'[gcs] per-start GCS[b]: {np.array2string(gcs_per_b, precision=3)}')
 
     payload = {
         'gcs': gcs,
+        'proposal': proposal,
         'gcs_per_b': [None if np.isnan(v) else float(v) for v in gcs_per_b],
         'n_valid_b': n_valid_b,
         'N': N,
@@ -410,11 +578,21 @@ def run(cfg: DictConfig):
         'var_scale': var_scale,
         'seed': int(cfg.seed),
         'pusht_angle_weight': float(_PUSHT_ANGLE_W),
+        'cache_traj': bool(cache_traj),
     }
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(payload, indent=2))
     # sidecar npz with the raw (N,B) surfaces for offline re-analysis / plots.
+    npz_extra = {}
+    if cache_traj and traj_states is not None:
+        # (N, B, T, state_dim) per-step true states + (B, goal_dim) goal vectors.
+        npz_extra['traj_states'] = traj_states.astype(np.float32)
+        npz_extra['goal_state'] = goal_vecs.astype(np.float32)
+        print(
+            f'[gcs] cache_traj: traj_states{traj_states.shape} '
+            f'goal_state{goal_vecs.shape} -> npz'
+        )
     np.savez_compressed(
         out_path.with_suffix('.npz'),
         c_model=c_model.astype(np.float32),
@@ -422,6 +600,7 @@ def run(cfg: DictConfig):
         gcs_per_b=gcs_per_b.astype(np.float32),
         eval_episodes=np.asarray(eval_episodes),
         eval_start=np.asarray(eval_start),
+        **npz_extra,
     )
     print(f'[gcs] wrote {out_path.resolve()}')
     print(f'[gcs] wrote {out_path.with_suffix(".npz").resolve()}')

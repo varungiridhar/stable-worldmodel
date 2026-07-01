@@ -1,0 +1,16 @@
+# Phase-4a Finger (DMControl) JEPA training data.
+# Mirrors data/cartpole.yaml; sources the random-policy Finger .lance collected by
+# scripts/data/collect_dmc_random.py. Trains on pixels + action (+ observation);
+# the privileged qpos/qvel columns are present on disk but not loaded here — they
+# are only read by the eval / GCS callables (plan/config/finger.yaml).
+dataset:
+  num_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}
+  frameskip: 5
+  name: dmc/finger_random.h5
+  keys_to_load:
+    - pixels
+    - action
+    - observation
+  keys_to_cache:
+    - action
+    - observation

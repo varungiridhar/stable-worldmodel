@@ -32,6 +32,63 @@ def ensure_dir_exists(path: Path):
         path.mkdir(parents=True, exist_ok=True)
 
 
+def filter_moving_starts(
+    dataset,
+    valid_indices,
+    offset,
+    thresh,
+    pos_col='privileged/block_0_pos',
+    episode_col='episode_idx',
+):
+    """Keep start rows whose tracked position MOVES over the goal horizon.
+
+    De-trivialises offset-goal eval / metric on manipulation tasks where the
+    object is stationary in most windows (e.g. OGBench-Cube: at offset 25 the
+    cube is already within the 0.04 m success threshold of its 25-ahead pose in
+    ~71% of windows, so random actions ``succeed``). A candidate start row ``r``
+    (a global dataset row) qualifies iff the tracked position moves at least
+    ``thresh`` over ``offset`` steps WITHIN the same episode::
+
+        ||pos[r + offset] - pos[r]|| >= thresh   and   episode(r+offset)==episode(r)
+
+    ``pos_col`` must be the SAME privileged position the task's success
+    criterion uses (the cube block position, ``privileged/block_0_pos``), so the
+    surviving windows are exactly those that demand real manipulation to reach
+    the goal -- and so eval and the GCS metric, fed the same ``valid_indices``,
+    seed and threshold, score an identical start set.
+
+    Rows are stored episode-contiguous and step-ordered (global row =
+    ``episode_offset + step_idx``), so the row ``offset`` steps ahead in the
+    same episode is ``r + offset``; the episode-id guard keeps the lookup from
+    crossing an episode boundary (it is always satisfied for rows already
+    restricted to ``step_idx <= episode_len - offset - 1``, but is kept explicit
+    so the filter is correct on its own).
+
+    Args:
+        dataset: swm dataset reader (provides ``get_col_data``).
+        valid_indices: 1-D int array of candidate global start rows.
+        offset: goal horizon in steps.
+        thresh: minimum L2 displacement (same units as ``pos_col``).
+        pos_col: column holding the tracked position (3-D for the cube).
+        episode_col: episode-index column name.
+
+    Returns:
+        The subset of ``valid_indices`` (ascending order preserved) that qualify.
+    """
+    valid_indices = np.asarray(valid_indices)
+    pos = np.asarray(dataset.get_col_data(pos_col), dtype=np.float64)
+    ep = np.asarray(dataset.get_col_data(episode_col))
+    ahead = valid_indices + int(offset)
+    in_ep = (ahead < len(pos)) & (
+        ep[np.minimum(ahead, len(pos) - 1)] == ep[valid_indices]
+    )
+    disp = np.full(len(valid_indices), -np.inf, dtype=np.float64)
+    disp[in_ep] = np.linalg.norm(
+        pos[ahead[in_ep]] - pos[valid_indices[in_ep]], axis=1
+    )
+    return valid_indices[disp >= float(thresh)]
+
+
 def load_dataset(
     name: str,
     cache_dir: str = None,
@@ -361,6 +418,7 @@ __all__ = [
     'convert',
     'get_cache_dir',
     'ensure_dir_exists',
+    'filter_moving_starts',
     'IdentityScaler',
     'PercentileScaler',
     'ZScoreScaler',

@@ -1,0 +1,101 @@
+# Phase-4b V-JEPA2-AC training config. Mirrors lewm.yaml (LeWM-style
+# action-conditioned predictor + sigreg) but swaps the trained ViT-tiny encoder
+# for a FROZEN V-JEPA2 ViT-L video encoder (embed_dim 1024, crop 256). Trains via
+# the existing scripts/train/lewm.py (its lejepa_forward only needs encode +
+# predict, both satisfied by VJEPA2AC):
+#   python scripts/train/lewm.py --config-name vjepa2ac data=tworoom
+defaults:
+  - _self_
+  - launcher: local
+  - data: tworoom # validation task first (most-validated)
+
+output_model_name: vjepa2ac
+subdir: ${hydra:job.id}
+
+num_workers: 6
+train_split: 0.9
+seed: 3072
+img_size: 256 # V-JEPA2 crop_size
+embed_dim: 1024 # V-JEPA2 ViT-L hidden size
+dump_object: True
+
+# --- Checkpointing --- (see prejepa.yaml for field semantics)
+ckpt:
+  epoch_interval: 1
+  intra_epoch_steps: []
+  intra_epoch_max_epoch: 0
+  step_interval: 0
+
+trainer:
+  max_epochs: 100
+  devices: auto
+  accelerator: gpu
+  precision: bf16
+  gradient_clip_val: 1.0
+
+loader:
+  batch_size: 32 # frozen ViT-L on 256^2 is heavy; keep modest
+  num_workers: ${num_workers}
+  drop_last: True
+  persistent_workers: True
+  prefetch_factor: 3
+  pin_memory: True
+  shuffle: True
+
+optimizer:
+  type: AdamW
+  lr: 1e-4 # only the projector + action-conditioned predictor train (encoder frozen)
+  weight_decay: 1e-3
+
+wm:
+  history_size: 3
+  num_preds: 1
+
+model:
+  _target_: stable_worldmodel.wm.vjepa2.VJEPA2AC
+  history_size: ${wm.history_size}
+  tubelet_size: 2
+  pool: mean
+  freeze_encoder: true
+  encoder:
+    _target_: stable_worldmodel.wm.prejepa.module.create_backbone
+    name: vjepa2_large # -> facebook/vjepa2-vitl-fpc64-256
+  predictor:
+    _target_: stable_worldmodel.wm.lewm.module.Predictor
+    num_frames: ${wm.history_size}
+    input_dim: ${embed_dim}
+    hidden_dim: ${embed_dim}
+    output_dim: ${embed_dim}
+    depth: 6
+    heads: 16
+    mlp_dim: 4096
+    dim_head: 64
+    dropout: 0.1
+    emb_dropout: 0.0
+  action_encoder:
+    _target_: stable_worldmodel.wm.lewm.module.Embedder
+    input_dim: ??? # set by lewm.py = frameskip * action_dim
+    emb_dim: ${embed_dim}
+  projector:
+    _target_: stable_worldmodel.wm.lewm.module.MLP
+    input_dim: ${embed_dim}
+    output_dim: ${embed_dim}
+    hidden_dim: 2048
+    norm_fn:
+      _target_: torch.nn.BatchNorm1d
+      _partial_: true
+  pred_proj:
+    _target_: stable_worldmodel.wm.lewm.module.MLP
+    input_dim: ${embed_dim}
+    output_dim: ${embed_dim}
+    hidden_dim: 2048
+    norm_fn:
+      _target_: torch.nn.BatchNorm1d
+      _partial_: true
+
+loss:
+  sigreg:
+    weight: 0.09
+    kwargs:
+      knots: 17
+      num_proj: 1024
